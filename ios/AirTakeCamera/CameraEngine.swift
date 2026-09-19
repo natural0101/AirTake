@@ -35,6 +35,20 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     var snapshot: CameraStats { lock.guarded { stats } }
     var isRecording: Bool { lock.guarded { running || stopping } }
 
+    // Frame the shot before recording; no HEVC encoder or disk session is opened here.
+    func prepare(settings: CaptureSettings) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            captureQueue.async { [self] in
+                do {
+                    guard !isRecording else { throw AirError.message("Дубль ещё завершается") }
+                    try settings.validate(); self.settings = settings
+                    try configureCamera()
+                    if !session.isRunning { session.startRunning() }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
     func start(settings: CaptureSettings, spool: SpoolSession, clockOffset: Double) {
         captureQueue.async { [self] in
             guard !isRecording else { onError?("Предыдущий дубль ещё завершается"); return }
@@ -111,7 +125,9 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         guard ready == noErr else { throw AirError.message("Не удалось подготовить HEVC: \(ready)") }
     }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard lock.guarded({ running }), let encoder, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        updatePreview(pixelBuffer)
+        guard lock.guarded({ running }), let encoder else { return }
         guard CVPixelBufferGetWidth(pixelBuffer) == settings.width, CVPixelBufferGetHeight(pixelBuffer) == settings.height else {
             fail("Камера вернула другое разрешение; масштабирование отключено"); return
         }
@@ -144,6 +160,9 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         let result = VTCompressionSessionEncodeFrame(encoder, imageBuffer: pixelBuffer, presentationTimeStamp: relative,
             duration: CMTime(value: 1, timescale: Int32(settings.fps)), frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
         if result != noErr { lock.guarded { pendingFrames = max(0, pendingFrames - 1); stats.outputDrops += 1 }; fail("Ошибка HEVC: \(result)"); return }
+    }
+    private func updatePreview(_ pixelBuffer: CVPixelBuffer) {
+        let now = hostTimeMs()
         if now - previewTime >= 500, lock.guarded({ if previewBusy { return false }; previewBusy = true; return true }) {
             previewTime = now
             previewQueue.async { [self] in
@@ -218,7 +237,14 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         if let encoder { VTCompressionSessionInvalidate(encoder); self.encoder = nil }
         lock.guarded { running = false; stopping = false }; onFinished?()
     }
-    func pausePreview() { captureQueue.async { [self] in if !isRecording && session.isRunning { session.stopRunning() } } }
+    func pausePreview() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            captureQueue.async { [self] in
+                if !isRecording && session.isRunning { session.stopRunning() }
+                continuation.resume()
+            }
+        }
+    }
     func setLocks(focus: Bool, exposure: Bool, whiteBalance: Bool) {
         captureQueue.async { [self] in
             guard let device else { return }

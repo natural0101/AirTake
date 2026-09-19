@@ -12,7 +12,9 @@ final class CameraModel: ObservableObject {
     @Published var recording = false
     @Published var scanning = false
     @Published var manualPairing = ""
-    @Published var focusLocked = false, exposureLocked = false, whiteBalanceLocked = false
+    @Published var focusLocked = false
+    @Published var exposureLocked = false
+    @Published var whiteBalanceLocked = false
     private var api: ReceiverAPI?
     private var pollTask: Task<Void, Never>?, uploadTask: Task<Void, Never>?
     private var sessions: [SpoolSession] = []
@@ -20,6 +22,7 @@ final class CameraModel: ObservableObject {
     private var activeSpool: SpoolSession?
     private var previewJpeg: String?
     private var activated = false
+    private var previewSettings: CaptureSettings?
 
     init() {
         engine.onError = { [weak self] message in Task { @MainActor in self?.error = String(message.prefix(1800)) } }
@@ -63,7 +66,7 @@ final class CameraModel: ObservableObject {
             bufferedBytes = sessions.reduce(0) { $0 + $1.queueBytes }
             let status = PhoneStatus(name: UIDevice.current.name, fps: stats.fps, captured: stats.captured, encoded: stats.encoded,
                 dropped: stats.dropped, queueBytes: bufferedBytes, thermal: thermalName,
-                error: error, takeId: activeSpool?.id, previewJpeg: previewJpeg)
+                error: error, takeId: activeSpool?.id ?? handledTake, previewJpeg: previewJpeg)
             do {
                 let control = try await api.status(status)
                 connection = "Подключено к ПК · TLS"
@@ -77,8 +80,13 @@ final class CameraModel: ObservableObject {
                     let spool = try SpoolSession(id: id, settings: control.settings)
                     handledTake = id; activeSpool = spool; sessions.append(spool)
                     engine.start(settings: control.settings, spool: spool, clockOffset: clockOffset)
+                    updateLocks()
                 } else if !control.recording && engine.isRecording {
                     engine.stop()
+                } else if !control.recording && !engine.isRecording && !scanning && previewSettings != control.settings {
+                    previewSettings = control.settings
+                    do { try await engine.prepare(settings: control.settings); updateLocks() }
+                    catch { self.error = error.localizedDescription }
                 }
             } catch {
                 // Network failure never cancels an otherwise healthy capture; the bounded disk spool absorbs it.
@@ -126,7 +134,10 @@ final class CameraModel: ObservableObject {
     func stop() { engine.stop() }
     func prepareScanner() {
         guard !engine.isRecording else { return }
-        engine.pausePreview(); scanning = true
+        Task {
+            await engine.pausePreview()
+            previewSettings = nil; scanning = true
+        }
     }
     func backgrounded() { if engine.isRecording { engine.stop(reason: "Приложение переведено в фон") } }
 }

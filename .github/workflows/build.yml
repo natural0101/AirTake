@@ -39,6 +39,8 @@ jobs:
         with:
           dotnet-version: 8.0.x
       - run: dotnet test tests/AirTake.Tests/AirTake.Tests.csproj -c Release --logger 'trx;LogFileName=tests.trx'
+      - name: Compile Windows frontend
+        run: dotnet build src/AirTake.Desktop/AirTake.Desktop.csproj -c Release -r win-x64 --self-contained false
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -52,8 +54,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm ffmpeg
-      - run: bash scripts/build-media.sh
+      - uses: actions/cache@v4
+        id: media-cache
+        with:
+          path: |
+            artifacts/media
+            artifacts/fixtures
+            artifacts/ffmpeg-*-source.tar.xz*
+          key: airtake-media-${{ runner.os }}-${{ hashFiles('scripts/build-media.sh') }}
+      - if: steps.media-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm ffmpeg
+      - if: steps.media-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-media.sh
       - uses: actions/upload-artifact@v4
         with:
           name: media-and-fixture

@@ -3,7 +3,7 @@ import CryptoKit
 import Security
 import CoreMedia
 
-struct CaptureSettings: Codable {
+struct CaptureSettings: Codable, Equatable {
     var width = 3840, height = 2160, fps = 120, bitrateMbps = 120, bufferMiB = 1024
     var stopOnDroppedFrame = true
     func validate() throws {

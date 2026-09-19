@@ -19,7 +19,18 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
     private readonly SemaphoreSlim completions = new(1);
     private Control command = new(null, false, preferences.Capture);
     public TakeStore Store { get; } = new(preferences.OutputFolder, (long)preferences.ReserveGiB * 1024 * 1024 * 1024);
-    public PhoneStatus? Phone { get; private set; }
+    private PhoneStatus? phone;
+    public PhoneStatus? Phone
+    {
+        get
+        {
+            var current = Volatile.Read(ref command); var snapshot = phone;
+            // Old-take errors must not stop a newly requested take before the phone has seen it.
+            return current.Recording && snapshot is not null && snapshot.TakeId != current.TakeId
+                ? snapshot with { Error = null } : snapshot;
+        }
+        private set { phone = value; }
+    }
     public double LastSeenMs { get; private set; }
     public bool PhoneOnline => Clock.NowMs - LastSeenMs < 5000;
     public Pairing? Pairing { get; private set; }

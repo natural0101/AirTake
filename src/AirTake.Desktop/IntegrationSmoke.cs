@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -11,8 +12,12 @@ public static class IntegrationSmoke
     public static async Task Run(string fixtureFolder)
     {
         var root = Path.Combine(Path.GetTempPath(), "AirTake-integration-" + Guid.NewGuid().ToString("N"));
-        var preferences = new Preferences { Address = "127.0.0.1", Port = 49713, OutputFolder = root, ReserveGiB = 1 };
+        using var occupied = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        occupied.Bind(new IPEndPoint(IPAddress.Loopback, 0)); occupied.Listen(1);
+        int busyPort = ((IPEndPoint)occupied.LocalEndPoint!).Port;
+        var preferences = new Preferences { Address = "127.0.0.1", Port = busyPort, OutputFolder = root, ReserveGiB = 1 };
         await using var receiver = new Receiver(preferences); await receiver.Start();
+        Check(preferences.Port != busyPort && preferences.Port > 0, "automatic port conflict recovery");
         using var handler = new HttpClientHandler { ServerCertificateCustomValidationCallback = (_, certificate, _, _) => certificate is not null && Integrity.Hash(certificate.RawData) == receiver.Pairing!.Fingerprint };
         using var http = new HttpClient(handler) { BaseAddress = new Uri(receiver.Pairing!.Url), Timeout = TimeSpan.FromSeconds(120) };
         var denied = await http.GetAsync("/api/time"); Check(denied.StatusCode == HttpStatusCode.Unauthorized, "authentication");
@@ -50,7 +55,7 @@ public static class IntegrationSmoke
         Check(video.GetProperty("codec_name").GetString()=="hevc","HEVC copy");
         Check(video.GetProperty("avg_frame_rate").GetString()=="120/1","120 FPS preserved");
         Check(streams.Any(s=>s.GetProperty("codec_type").GetString()=="audio" && s.GetProperty("sample_rate").GetString()=="48000"),"48 kHz audio mux");
-        await File.WriteAllTextAsync(Path.Combine(fixtureFolder,"integration-result.txt"),"PASS: TLS pin, authentication, upload, reassembly, HEVC 3840x2160/120, AAC 48 kHz. Synthetic fixture; real camera NOT tested.\n"+json);
+        await File.WriteAllTextAsync(Path.Combine(fixtureFolder,"integration-result.txt"),"PASS: occupied-port recovery, TLS pin, authentication, chunked JSON, upload, reassembly, HEVC 3840x2160/120, AAC 48 kHz. Synthetic fixture; real camera NOT tested.\n"+json);
     }
     private static async Task Ensure(HttpResponseMessage response)
     {

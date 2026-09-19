@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -120,7 +121,27 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
             finally { completions.Release(); }
         });
         app.MapGet("/api/takes/{id:guid}", (Guid id) => Results.Json(Store.Get(id)));
-        await app.StartAsync(); Log?.Invoke("Приёмник запущен. TLS и проверка SHA-256 включены.");
+        try { await app.StartAsync(); }
+        catch (Exception ex) when (preferences.Port != 0 && PortUnavailable(ex))
+        {
+            Log?.Invoke($"Порт {preferences.Port} занят или зарезервирован Windows. Выбираю свободный.");
+            await app.DisposeAsync(); app = null;
+            certificate?.Dispose(); certificate = null;
+            preferences.Port = 0; await Start(); return;
+        }
+        if (preferences.Port == 0)
+        {
+            var endpoint = new Uri(app.Urls.Single());
+            preferences.Port = endpoint.Port;
+            Pairing = new(1, endpoint.GetLeftPart(UriPartial.Authority), preferences.Token, Integrity.Hash(certificate.RawData));
+        }
+        Log?.Invoke("Приёмник запущен. TLS и проверка SHA-256 включены.");
+    }
+    private static bool PortUnavailable(Exception error)
+    {
+        for (Exception? current = error; current is not null; current = current.InnerException)
+            if (current is SocketException socket && socket.SocketErrorCode is SocketError.AccessDenied or SocketError.AddressAlreadyInUse) return true;
+        return false;
     }
     private static bool LimitJsonBody(HttpContext context, long limit)
     {

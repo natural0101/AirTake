@@ -69,23 +69,38 @@ jobs:
           $lines | Set-Content package/SHA256SUMS.txt
           Compress-Archive -Path package/* -DestinationPath AirTake-Moblin-Windows-x64.zip -Force
       - uses: actions/upload-artifact@v4
+        id: executable
         with:
           name: AirTake-Moblin-Windows-x64
           path: AirTake-Moblin-Windows-x64.zip
           if-no-files-found: error
           retention-days: 30
-      - name: Publish downloadable prerelease
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirTake-Moblin-QA
+          path: qa/
+          retention-days: 30
+      - name: Download link
+        shell: pwsh
+        run: |
+          @'
+          ## AirTake Moblin Windows
+          [Download the tested portable Windows application](${{ steps.executable.outputs.artifact-url }})
+          Extract the downloaded artifact, then extract the inner application ZIP and run AirTake.exe with its tools directory.
+          Synthetic HEVC 4K120/SRT and Windows UI checks passed. Physical iPhone, real Wi-Fi and Fifine validation is not included in CI.
+          '@ | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Optional GitHub Releases publication
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = 'moblin-v0.2.0-${{ github.run_number }}'
-          gh release create $tag AirTake-Moblin-Windows-x64.zip qa/tests.json qa/desktop.png --target '${{ github.sha }}' --title 'AirTake Moblin Windows · 0.2.0 · build ${{ github.run_number }}' --prerelease --notes 'Extract the entire ZIP and launch AirTake.exe. The iPhone sender is the existing Moblin app, not a custom iOS application. Includes SRT/HEVC stream-copy, Fifine/PC microphone, QR preset, settings, reconnect, optional preview and MP4. Tests are synthetic: physical iPhone/Wi-Fi/Fifine validation is still required. 120 FPS is experimental in Moblin; exact automatic A/V sync and recovery of missing source frames are not claimed.'
-          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: AirTake-Moblin-QA
-          path: qa/
-          retention-days: 30
+          gh release create $tag AirTake-Moblin-Windows-x64.zip qa/tests.json qa/desktop.png --target '${{ github.sha }}' --title 'AirTake Moblin Windows · 0.2.0 · build ${{ github.run_number }}' --prerelease --notes 'Extract the entire ZIP and launch AirTake.exe. The iPhone sender is the existing Moblin app. Includes SRT/HEVC stream-copy, Fifine/PC microphone, QR preset, settings, reconnect, optional preview and MP4. Tests are synthetic: physical iPhone/Wi-Fi/Fifine validation is still required. 120 FPS is experimental in Moblin; exact automatic A/V sync and recovery of missing source frames are not claimed.'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::warning::Optional Releases publication failed. The tested application and QA report remain downloadable as Actions artifacts. No build or test failure is suppressed.'
+            exit 1
+          }

@@ -1,0 +1,29 @@
+name: AirTakeCamera
+options:
+  minimumXcodeGenVersion: 2.42.0
+  deploymentTarget:
+    iOS: '18.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    IPHONEOS_DEPLOYMENT_TARGET: '18.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    GENERATE_INFOPLIST_FILE: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  AirTakeCamera:
+    type: application
+    platform: iOS
+    sources:
+      - AirTakeCamera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.natural0101.airtake.camera
+        PRODUCT_NAME: AirTakeCamera
+        INFOPLIST_FILE: AirTakeCamera/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: ''
+    scheme:
+      gatherCoverageData: false

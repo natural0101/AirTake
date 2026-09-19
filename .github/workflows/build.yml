@@ -28,6 +28,8 @@ jobs:
         with:
           name: ffmpeg-win
           path: .ffmpeg-win/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 7
   windows:
     runs-on: windows-latest
@@ -64,6 +66,7 @@ jobs:
         with:
           name: AirTake-Windows-x64
           path: AirTake-Windows-x64.zip
+          if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always()

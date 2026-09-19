@@ -1,0 +1,73 @@
+name: Build AirTake
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: airtake-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ffmpeg:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: .ffmpeg-win
+          key: ffmpeg-8.0.3-airtake-minimal-v1
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 make
+          bash scripts/build-ffmpeg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-win
+          path: .ffmpeg-win/
+          retention-days: 7
+  windows:
+    runs-on: windows-latest
+    needs: ffmpeg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-win
+          path: package/tools
+      - name: Protocol and real mux integration tests
+        shell: pwsh
+        run: |
+          dotnet run --project tests/AirTake.Tests -c Release -- "$PWD/package/tools/ffmpeg.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+      - name: Publish self-contained Windows EXE
+        run: dotnet publish src/AirTake.Desktop -c Release -r win-x64 -o package -p:DebugType=None -p:DebugSymbols=false
+      - name: Launch EXE and render the actual desktop UI
+        shell: pwsh
+        run: |
+          New-Item qa -ItemType Directory -Force | Out-Null
+          $p = Start-Process -FilePath "$PWD/package/AirTake.exe" -ArgumentList @('--smoke-test', "$PWD/qa/desktop.png") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { if (Test-Path smoke-error.txt) { Get-Content smoke-error.txt }; throw 'EXE smoke test failed' }
+      - name: Package portable application
+        shell: pwsh
+        run: |
+          if (Test-Path README.md) { Copy-Item README.md package/README.md }
+          Get-ChildItem package -Recurse -File | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize | Out-File package/SHA256SUMS.txt
+          Compress-Archive -Path package/* -DestinationPath AirTake-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirTake-Windows-x64
+          path: AirTake-Windows-x64.zip
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirTake-QA
+          path: qa/
+          retention-days: 30

@@ -6,6 +6,7 @@ using AirTake.Core;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Logging;
 
@@ -85,7 +86,7 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
         app.MapGet("/api/time", () => Results.Json(new { serverTimeMs = Clock.NowMs }));
         app.MapPost("/api/status", async (HttpContext context) =>
         {
-            if (context.Request.ContentLength is null or > 512_000) return Results.BadRequest();
+            if (!LimitJsonBody(context, 512_000)) return Results.StatusCode(413);
             var status = await context.Request.ReadFromJsonAsync<PhoneStatus>();
             if (status is null || status.Name.Length > 256 || status.Thermal.Length > 64 || (status.Error?.Length ?? 0) > 2048) return Results.BadRequest();
             Phone = status; LastSeenMs = Clock.NowMs;
@@ -105,7 +106,7 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
         });
         app.MapPost("/api/takes/{id:guid}/complete", async (Guid id, HttpContext context) =>
         {
-            if (context.Request.ContentLength is null or > 16_384) return Results.BadRequest();
+            if (!LimitJsonBody(context, 16_384)) return Results.StatusCode(413);
             var completion = await context.Request.ReadFromJsonAsync<Completion>();
             if (completion is null) return Results.BadRequest();
             // Once commit starts, a client timeout must not cancel a durable seal/export.
@@ -120,6 +121,14 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
         });
         app.MapGet("/api/takes/{id:guid}", (Guid id) => Results.Json(Store.Get(id)));
         await app.StartAsync(); Log?.Invoke("Приёмник запущен. TLS и проверка SHA-256 включены.");
+    }
+    private static bool LimitJsonBody(HttpContext context, long limit)
+    {
+        if (context.Request.ContentLength > limit) return false;
+        // JSON may use chunked transfer; enforce a byte limit rather than requiring Content-Length.
+        if (context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } feature)
+            feature.MaxRequestBodySize = limit;
+        return true;
     }
     public async ValueTask DisposeAsync()
     {

@@ -78,7 +78,7 @@ public sealed class Receiver(Preferences preferences) : IAsyncDisposable
             catch (Exception ex) when (ex is ArgumentException or InvalidDataException or FileNotFoundException or InvalidOperationException or IOException)
             {
                 if (context.Response.HasStarted) { context.Abort(); return; }
-                context.Response.StatusCode = ex is FileNotFoundException ? 404 : ex is IOException and not InvalidDataException ? 507 : 409;
+                context.Response.StatusCode = ex is FileNotFoundException ? 404 : ex is IOException ? 507 : 409;
                 await context.Response.WriteAsJsonAsync(new { error = ex.Message }); Log?.Invoke(ex.Message);
             }
         });

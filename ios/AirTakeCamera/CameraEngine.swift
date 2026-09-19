@@ -22,10 +22,21 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private var previewData: Data?
     private var lastPreviewTime = 0.0
     private var clockOffset = 0.0
-    private var clockRtt = 0.0
     private var failureReported = false
+    private var encodedQueueCount = 0
+    private var observers: [NSObjectProtocol] = []
     var onFailure: ((String) -> Void)?
 
+    override init() {
+        super.init()
+        for name in [AVCaptureSession.wasInterruptedNotification, AVCaptureSession.runtimeErrorNotification] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: session, queue: nil) { [weak self] _ in
+                guard let self else { return }
+                self.captureQueue.async { if self.recording { self.fail("Система прервала работу камеры. Завершённые фрагменты сохраняются.") } }
+            })
+        }
+    }
+    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
     var snapshot: CameraSnapshot { statsLock.lock(); defer { statsLock.unlock() }; return snapshotValue }
     private func stats(_ update: (inout CameraSnapshot) -> Void) { statsLock.lock(); update(&snapshotValue); statsLock.unlock() }
     func takePreview() -> Data? { previewLock.lock(); defer { previewLock.unlock() }; let data = previewData; previewData = nil; return data }
@@ -97,7 +108,6 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
         options = requested
         stats { $0.mode = "\(requested.width)x\(requested.height) / \(requested.fps)" }
-        // startRunning must occur only after commitConfiguration and unlocking the device.
         captureQueue.async { if !self.session.isRunning { self.session.startRunning() } }
     }
     func pausePreview() async {
@@ -114,7 +124,7 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     }
     private func armOnQueue() throws {
         if let compressor { VTCompressionSessionInvalidate(compressor); self.compressor = nil }
-        failureReported = false
+        statsLock.lock(); failureReported = false; encodedQueueCount = 0; statsLock.unlock()
         firstPTS = nil
         encodeQueue.sync { writer = nil; writerInput = nil }
         stats { $0 = CameraSnapshot(); $0.mode = "\(options.width)x\(options.height) / \(options.fps)" }
@@ -125,7 +135,20 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
             if status != noErr { engine.fail("HEVC encoder error: \(status)"); return }
             if flags.contains(.frameDropped) { engine.stats { $0.end.encoderDrops += 1 }; return }
             guard let sample else { engine.fail("HEVC encoder returned an empty sample."); return }
-            engine.encodeQueue.async { engine.appendEncoded(sample) }
+            engine.statsLock.lock()
+            engine.encodedQueueCount += 1
+            let overflow = engine.encodedQueueCount > 240
+            engine.statsLock.unlock()
+            if overflow {
+                engine.statsLock.lock(); engine.encodedQueueCount -= 1; engine.statsLock.unlock()
+                engine.stats { $0.end.writerDrops += 1 }
+                engine.fail("Очередь MP4 не успевает за камерой. Запись остановлена без снижения FPS.")
+                return
+            }
+            engine.encodeQueue.async {
+                engine.appendEncoded(sample)
+                engine.statsLock.lock(); engine.encodedQueueCount -= 1; engine.statsLock.unlock()
+            }
         }, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &compressor)
         guard status == noErr, let compressor else { throw AirTakeError.message("Аппаратный HEVC-энкодер не открылся для этого режима: \(status).") }
         do {
@@ -139,7 +162,7 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
             let prepared = VTCompressionSessionPrepareToEncodeFrames(compressor)
             guard prepared == noErr else { throw AirTakeError.message("HEVC prepare failed: \(prepared)") }
             var hardware: CFTypeRef?
-            let queried = VTSessionCopyProperty(compressor, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: kCFAllocatorDefault, propertyValueOut: &hardware)
+            let queried = VTSessionCopyProperty(compressor, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: kCFAllocatorDefault, valueOut: &hardware)
             guard queried == noErr, (hardware as? NSNumber)?.boolValue == true else { throw AirTakeError.message("Аппаратное кодирование не подтверждено. Программный fallback запрещён.") }
             stats { $0.hardware = true }
         } catch { VTCompressionSessionInvalidate(compressor); self.compressor = nil; throw error }
@@ -151,7 +174,7 @@ final class CameraEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     func begin(offset: Double, rtt: Double, sink: @escaping (Data) throws -> Void) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             captureQueue.async {
-                self.clockOffset = offset; self.clockRtt = rtt; self.segmentSink = sink; self.recording = true
+                self.clockOffset = offset; self.segmentSink = sink; self.recording = true
                 self.stats { $0.end.clockRttMs = rtt }
                 continuation.resume()
             }

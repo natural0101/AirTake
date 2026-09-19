@@ -13,7 +13,7 @@ int passed = 0;
 var failures = new List<string>();
 async Task Test(string name, Func<Task> action)
 {
-    try { await action(); passed++; Console.WriteLine("PASS " + name); }
+    try { await action().WaitAsync(TimeSpan.FromMinutes(2)); passed++; Console.WriteLine("PASS " + name); }
     catch (Exception e) { failures.Add(name + ": " + e); Console.WriteLine("FAIL " + name + ": " + e.Message); }
 }
 void Assert(bool value, string message = "Assertion failed") { if (!value) throw new Exception(message); }
@@ -22,6 +22,9 @@ async Task Reject(int code, Func<Task> action)
     try { await action(); throw new Exception("Expected rejection " + code); }
     catch (ProtocolException e) { Assert(e.Status == code, $"Expected {code}, got {e.Status}"); }
 }
+// AirTake's wire protocol deliberately requires Content-Length; JsonContent is
+// chunked by default. Use bounded StringContent like the iPhone client does.
+Task<HttpResponseMessage> Post(HttpClient client, string path, object value) => client.PostAsync(path, new StringContent(JsonSerializer.Serialize(value, Wire.Json), Encoding.UTF8, "application/json"));
 var init = new byte[] { 0,0,0,16,102,116,121,112,105,115,111,54,0,0,0,0 };
 var media = Encoding.ASCII.GetBytes("\0\0\0\u0010moofTESTDATA");
 AppOptions Options() => new() { OutputDirectory = root, VideoOnly = true, KeepSources = true, FfmpegPath = Environment.ProcessPath! };
@@ -43,38 +46,48 @@ await Test("non-MP4 initialization rejected", () => Reject(422, async () => { aw
 await Test("incomplete take cannot finalize", async () => { var s = NewStore(); await Send(s, 0, init); await Reject(409, () => { s.ValidateComplete(2); return Task.CompletedTask; }); });
 await Test("source assembly is byte-exact", async () => { var s = NewStore(); await Send(s, 0, init); await Send(s, 1, media); using var output = new MemoryStream(); await s.CopyVideoToAsync(output); Assert(output.ToArray().SequenceEqual(init.Concat(media))); });
 await Test("on-disk corruption detected", async () => { var s = NewStore(); await Send(s, 0, init); File.WriteAllBytes(s.ChunkPath(0), media); try { await s.CopyVideoToAsync(Stream.Null); throw new Exception("Corruption ignored"); } catch (InvalidDataException) { } });
+await Test("receiver restart preserves next sequence number", async () => { var s = NewStore(); await Send(s, 0, init); var restored = TakeStore.Load(root,s.Manifest.Id); Assert(await Send(restored,0,init) == 1); Assert(await Send(restored,1,media) == 2); });
 await Test("identity tokens are random and certificate pins match", () => { var a = Identity.Create(); var b = Identity.Create(); Assert(a.Token.Length == 64 && a.Token != b.Token && a.Pin == Wire.Hash(a.Certificate.RawData)); a.Certificate.Dispose(); b.Certificate.Dispose(); return Task.CompletedTask; });
-await Test("HTTPS receiver: authentication, REC lifecycle, retransmission, finish", async () =>
+await Test("HTTPS receiver: auth, bounded JSON, REC, retransmission, finish, abort", async () =>
 {
     var options = Options(); options.ListenAddress = "127.0.0.1";
     var probe = new TcpListener(IPAddress.Loopback, 0); probe.Start(); options.Port = ((IPEndPoint)probe.LocalEndpoint).Port; probe.Stop();
     var identity = Identity.Create();
     await using var server = new ReceiverHost(options, identity, new NoAudioRecorder(), s => s.ExportFragmentedVideoAsync());
+    server.Log += text => Console.WriteLine("  receiver: " + text);
     await server.StartAsync();
     using var handler = new HttpClientHandler { ServerCertificateCustomValidationCallback = (_, certificate, _, _) => certificate is not null && Wire.Hash(certificate.RawData) == identity.Pin };
     using var client = new HttpClient(handler) { BaseAddress = new Uri($"https://127.0.0.1:{options.Port}"), Timeout = TimeSpan.FromSeconds(15) };
     Assert((await client.GetAsync("/v1/clock")).StatusCode == HttpStatusCode.Unauthorized);
     client.DefaultRequestHeaders.Authorization = new("Bearer", identity.Token);
     var clock = await client.GetFromJsonAsync<JsonElement>("/v1/clock"); Assert(clock.GetProperty("version").GetInt32() == 1);
-    (await client.PostAsJsonAsync("/v1/heartbeat", new { clientId = "integration", status = "ready" })).EnsureSuccessStatusCode();
+    Assert((await client.PostAsJsonAsync("/v1/heartbeat", new { clientId = "integration", status = "ready" })).StatusCode == HttpStatusCode.RequestEntityTooLarge, "Unbounded JSON must be rejected");
+    (await Post(client,"/v1/heartbeat", new { clientId = "integration", status = "ready" })).EnsureSuccessStatusCode();
     var id = Guid.NewGuid().ToString();
-    Assert((await client.PostAsJsonAsync("/v1/start", new { id, clientId = "integration" })).StatusCode == HttpStatusCode.Conflict);
+    Assert((await Post(client,"/v1/start", new { id, clientId = "integration" })).StatusCode == HttpStatusCode.Conflict);
     server.RequestRecording(true);
-    (await client.PostAsJsonAsync("/v1/start", new { id, clientId = "integration" })).EnsureSuccessStatusCode();
-    (await client.PostAsJsonAsync("/v1/start", new { id, clientId = "integration" })).EnsureSuccessStatusCode();
-    Assert((await client.PostAsJsonAsync($"/v1/takes/{id}/finish", new { chunks = 2 })).StatusCode == HttpStatusCode.Conflict);
+    (await Post(client,"/v1/start", new { id, clientId = "integration" })).EnsureSuccessStatusCode();
+    (await Post(client,"/v1/start", new { id, clientId = "integration" })).EnsureSuccessStatusCode();
+    Assert((await Post(client,$"/v1/takes/{id}/finish", new { chunks = 2 })).StatusCode == HttpStatusCode.Conflict);
     for (int i = 0; i < 2; i++)
     {
         var data = i == 0 ? init : media;
         using var content = new ByteArrayContent(data); content.Headers.Add("X-SHA256", Wire.Hash(data));
         (await client.PostAsync($"/v1/takes/{id}/chunks/{i}", content)).EnsureSuccessStatusCode();
     }
-    (await client.PostAsJsonAsync($"/v1/takes/{id}/end", new TakeEnd { VideoStartUnix = Clock.Now, Duration = 0.2, Captured = 24, Encoded = 24 })).EnsureSuccessStatusCode();
-    var response = await client.PostAsJsonAsync($"/v1/takes/{id}/finish", new { chunks = 2 });
+    Assert((await Post(client,$"/v1/takes/{id}/abort", new { })).StatusCode == HttpStatusCode.Conflict, "Nonempty take must not be aborted");
+    (await Post(client,$"/v1/takes/{id}/end", new TakeEnd { VideoStartUnix = Clock.Now, Duration = 0.2, Captured = 24, Encoded = 24 })).EnsureSuccessStatusCode();
+    var response = await Post(client,$"/v1/takes/{id}/finish", new { chunks = 2 });
     Assert(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
     Assert(!server.Busy);
-    (await client.PostAsJsonAsync($"/v1/takes/{id}/finish", new { chunks = 2 })).EnsureSuccessStatusCode();
+    (await Post(client,$"/v1/takes/{id}/finish", new { chunks = 2 })).EnsureSuccessStatusCode();
     Assert(TakeStore.Load(root, id).Manifest.State == "complete");
+    var empty = Guid.NewGuid().ToString();
+    server.RequestRecording(true);
+    (await Post(client,"/v1/start", new { id = empty, clientId = "integration" })).EnsureSuccessStatusCode();
+    (await Post(client,$"/v1/takes/{empty}/abort", new { })).EnsureSuccessStatusCode();
+    (await Post(client,$"/v1/takes/{empty}/abort", new { })).EnsureSuccessStatusCode();
+    Assert(!server.Busy && TakeStore.Load(root,empty).Manifest.State == "aborted-empty");
     identity.Certificate.Dispose();
 });
 
@@ -102,11 +115,12 @@ if (args.Length > 0)
         }
         s.Manifest.Audio = new AudioInfo(Clock.Now - 0.1,48000,1,16,samples);
         s.Manifest.End = new TakeEnd { VideoStartUnix = s.Manifest.Audio.StartUnix + 0.1, Duration = 0.2, Captured = 24, Encoded = 24 };
-        var output = await Muxer.FinalizeAsync(s, args[0]);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var output = await Muxer.FinalizeAsync(s, args[0], timeout.Token);
         Assert(File.Exists(output) && new FileInfo(output).Length > 100);
         var start = new ProcessStartInfo(args[0]) { RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         start.ArgumentList.Add("-hide_banner"); start.ArgumentList.Add("-i"); start.ArgumentList.Add(output);
-        using var p = Process.Start(start)!; var info = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync();
+        using var p = Process.Start(start)!; var info = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync(timeout.Token);
         Assert(info.Contains("120 fps") && info.Contains("hevc") && info.Contains("aac"), info);
         Directory.CreateDirectory("qa"); File.Copy(output, Path.Combine("qa","mux-120fps.mp4"), true); File.WriteAllText(Path.Combine("qa","mux-probe.txt"), info);
     });

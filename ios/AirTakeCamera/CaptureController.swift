@@ -8,6 +8,7 @@ final class CaptureController: ObservableObject {
     @Published var connected = false
     @Published var recording = false
     @Published var working = false
+    @Published var scanning = false
     @Published var status = "Подключите Windows-приложение"
     @Published var errorText = ""
     @Published var receiverName = "Нет подключения"
@@ -41,7 +42,7 @@ final class CaptureController: ObservableObject {
         if let previous = PairingKeychain.read() { await connect(previous) }
     }
     func connect(_ code: String) async {
-        guard !recording, !working else { return }
+        guard !recording, !working, !scanning else { return }
         guard spool != nil else { return }
         working = true
         defer { working = false }
@@ -62,17 +63,18 @@ final class CaptureController: ObservableObject {
     }
     private func poll() async {
         while !Task.isCancelled {
+            if scanning { try? await Task.sleep(nanoseconds: 250_000_000); continue }
             do {
                 guard let api else { return }
                 let control = try await api.get("/v1/control", as: ControlReply.self)
                 guard control.version == 1 else { throw AirTakeError.message("Версии приложений несовместимы.") }
                 connected = true
-                if !recording, !working, spool?.metadata == nil, configured != control.capture {
+                if !recording, !working, !scanning, spool?.metadata == nil, configured != control.capture {
                     try await camera.configure(control.capture)
                     configured = control.capture
                     errorText = ""; status = "Готово к записи"
                 }
-                if control.recording, !recording, !working, !stopping, spool?.metadata == nil { await begin(control.capture) }
+                if control.recording, !recording, !working, !stopping, !scanning, spool?.metadata == nil { await begin(control.capture) }
                 if !control.recording, recording { await stop() }
                 let snapshot = camera.snapshot
                 measuredFps = snapshot.fps; hardware = snapshot.hardware
@@ -99,7 +101,7 @@ final class CaptureController: ObservableObject {
                 status = "Нет связи с ПК · \(error.localizedDescription)"
                 if case AirTakeError.message = error {
                     errorText = error.localizedDescription
-                    try? await api?.post("/v1/heartbeat", PhoneTelemetry(clientId: clientId, status: "error", message: errorText))
+                    _ = try? await api?.post("/v1/heartbeat", PhoneTelemetry(clientId: clientId, status: "error", message: errorText))
                 }
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -107,7 +109,7 @@ final class CaptureController: ObservableObject {
     }
     func requestRecording() async {
         if recording { await stop(); return }
-        guard connected, !working, !hasPendingTake, let api else { return }
+        guard connected, !working, !scanning, !hasPendingTake, let api else { return }
         errorText = ""
         do { try await api.post("/v1/intent", Intent(recording: true)); status = "Подготовка записи…" }
         catch { errorText = error.localizedDescription }
@@ -133,24 +135,19 @@ final class CaptureController: ObservableObject {
             recording = true
             UIApplication.shared.isIdleTimerDisabled = true
             await camera.begin(offset: clock.offset, rtt: clock.rtt) { data in try spool.append(data) }
-            status = "REC · оригинальные кадры HEVC"
-            errorText = ""
-            startUploader()
+            status = "REC · оригинальные кадры HEVC"; errorText = ""; startUploader()
         } catch {
             recording = false
             let end = await camera.finish(error: error.localizedDescription)
             try? spool.close(end)
-            try? await api.post("/v1/intent", Intent(recording: false))
+            _ = try? await api.post("/v1/intent", Intent(recording: false))
             errorText = error.localizedDescription
             UIApplication.shared.isIdleTimerDisabled = false
             startUploader()
         }
     }
     func stop(reason: String = "") async {
-        guard recording, !stopping, let spool else {
-            if !reason.isEmpty { errorText = reason }
-            return
-        }
+        guard recording, !stopping, let spool else { if !reason.isEmpty { errorText = reason }; return }
         stopping = true; working = true; recording = false
         defer { stopping = false; working = false }
         status = "Завершение фрагментов…"
@@ -159,19 +156,15 @@ final class CaptureController: ObservableObject {
         catch { errorText = "Не удалось сохранить журнал: \(error.localizedDescription)" }
         if !reason.isEmpty { errorText = reason }
         UIApplication.shared.isIdleTimerDisabled = false
-        // Stop the camera BEFORE attempting another network request.
-        try? await api?.post("/v1/intent", Intent(recording: false))
-        status = "Передача оставшихся фрагментов…"
-        startUploader()
+        configured = nil
+        _ = try? await api?.post("/v1/intent", Intent(recording: false))
+        status = "Передача оставшихся фрагментов…"; startUploader()
     }
     private func startUploader() {
         guard uploading == nil, api != nil, spool != nil else { return }
         uploading = Task { [weak self] in await self?.uploadLoop() }
     }
-    func retryUpload() {
-        errorText = ""
-        startUploader()
-    }
+    func retryUpload() { errorText = ""; startUploader() }
     private func uploadLoop() async {
         defer { uploading = nil }
         var attempt = 0
@@ -181,18 +174,13 @@ final class CaptureController: ObservableObject {
             do {
                 if state.closed, state.nextIndex == 0 {
                     do { try await api.post("/v1/takes/\(state.id)/abort", Empty()) }
-                    catch AirTakeError.http(let code, _) where code == 404 { /* Start request never reached this receiver. */ }
+                    catch AirTakeError.http(let code, _) where code == 404 { }
                     try spool.clearCompleted(); status = "Пустой дубль отменён"; attempt = 0; continue
                 }
-                if state.closed, !state.endSent {
-                    try await api.post("/v1/takes/\(state.id)/end", state.end)
-                    try spool.markEndSent()
-                }
+                if state.closed, !state.endSent { try await api.post("/v1/takes/\(state.id)/end", state.end); try spool.markEndSent() }
                 if let pending = spool.nextPending() {
                     let acknowledged = try await api.upload(id: pending.id, index: pending.index, url: pending.url)
-                    try spool.acknowledge(acknowledged)
-                    pendingBytes = spool.pendingBytes
-                    attempt = 0
+                    try spool.acknowledge(acknowledged); pendingBytes = spool.pendingBytes; attempt = 0
                 } else if state.closed {
                     status = "ПК собирает MP4…"
                     try await api.post("/v1/takes/\(state.id)/finish", Finish(chunks: state.nextIndex))
@@ -220,7 +208,12 @@ final class CaptureController: ObservableObject {
         do { let result = try await api.speedTest(); speed = String(format: "%.0f Мбит/с · тест 32 МиБ", result) }
         catch { errorText = error.localizedDescription }
     }
-    func prepareScanner() async { await camera.pausePreview(); configured = nil }
+    func prepareScanner() async {
+        guard !working, !recording else { return }
+        scanning = true
+        await camera.pausePreview(); configured = nil
+    }
+    func finishScanner() { scanning = false; configured = nil }
     func backgrounded() async {
         guard recording else { return }
         let task = UIApplication.shared.beginBackgroundTask(withName: "AirTake finish")

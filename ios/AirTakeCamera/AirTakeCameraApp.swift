@@ -4,15 +4,14 @@ import SwiftUI
 @main
 struct AirTakeCameraApp: App {
     @StateObject private var controller = CaptureController()
-    var body: some Scene {
-        WindowGroup { CameraScreen(model: controller).preferredColorScheme(.dark) }
-    }
+    var body: some Scene { WindowGroup { CameraScreen(model: controller).preferredColorScheme(.dark) } }
 }
 
 struct CameraScreen: View {
     @ObservedObject var model: CaptureController
     @Environment(\.scenePhase) private var scenePhase
     @State private var scanner = false
+    @State private var scannedCode: String?
     @State private var pairCode = ""
     var body: some View {
         HStack(spacing: 0) {
@@ -37,9 +36,9 @@ struct CameraScreen: View {
                     Button { Task { await model.requestRecording() } } label: {
                         Text(model.recording ? "ОСТАНОВИТЬ" : "REC / ЗАПИСАТЬ").font(.headline).frame(maxWidth: .infinity).padding(.vertical, 10)
                     }.buttonStyle(.borderedProminent).tint(model.recording ? .red : .mint)
-                        .disabled(!model.connected || (model.working && !model.recording) || (model.hasPendingTake && !model.recording))
+                        .disabled((!model.connected && !model.recording) || (model.working && !model.recording) || (model.hasPendingTake && !model.recording))
                     HStack {
-                        Button("Сканировать QR") { Task { await model.prepareScanner(); scanner = true } }
+                        Button("Сканировать QR") { Task { await model.prepareScanner(); if model.scanning { scanner = true } } }
                         Button("Тест Wi-Fi") { Task { await model.testNetwork() } }
                     }.buttonStyle(.bordered).disabled(model.recording || model.working)
                     if !model.speed.isEmpty { Text(model.speed).font(.caption).foregroundStyle(.mint) }
@@ -53,9 +52,12 @@ struct CameraScreen: View {
         }.ignoresSafeArea(edges: .bottom)
             .task { await model.bootstrap() }
             .onChange(of: scenePhase) { _, phase in if phase != .active { Task { await model.backgrounded() } } }
-            .fullScreenCover(isPresented: $scanner) {
-                QRScanner { code in scanner = false; Task { await model.connect(code) } }
-                    .overlay(alignment: .topTrailing) { Button("Отмена") { scanner = false }.buttonStyle(.borderedProminent).padding(24) }
+            .fullScreenCover(isPresented: $scanner, onDismiss: {
+                model.finishScanner()
+                if let code = scannedCode { scannedCode = nil; Task { await model.connect(code) } }
+            }) {
+                QRScanner { code in scannedCode = code; scanner = false }
+                    .overlay(alignment: .topTrailing) { Button("Отмена") { scannedCode = nil; scanner = false }.buttonStyle(.borderedProminent).padding(24) }
             }
     }
     private func metric(_ title: String, _ value: String) -> some View {
@@ -65,7 +67,6 @@ struct CameraScreen: View {
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }
-
 private final class PreviewView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }

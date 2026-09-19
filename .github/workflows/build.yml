@@ -2,13 +2,25 @@ name: Build AirTake
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/AirTake.Core/**'
+      - 'src/AirTake.Desktop/**'
+      - 'ios/**'
+      - 'tests/**'
+      - 'scripts/build-ffmpeg.sh'
+      - '.github/workflows/build.yml'
+      - 'Directory.Build.props'
+      - 'global.json'
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: airtake-${{ github.ref }}
-  cancel-in-progress: true
+  group: airtake-native-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   ffmpeg:
     runs-on: ubuntu-24.04

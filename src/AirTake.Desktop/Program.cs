@@ -52,7 +52,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock url = Text("", 14);
     private readonly TextBlock warning = Text("4K/120 проверяется на устройстве. Автоматического перехода на 60 FPS нет.", 12);
     private readonly Image preview = new() { Stretch = Stretch.Uniform };
-    private readonly Image qr = new() { Width = 216, Height = 216, Margin = new(0, 14, 0, 14) };
+    private readonly Image qr = new() { Width = 192, Height = 192, Margin = new(0, 12, 0, 12) };
     private readonly TextBox log = new() { IsReadOnly = true, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Background = Brushes.Transparent, Foreground = Brush("A8B8CF"), BorderThickness = new(0), FontFamily = new("Consolas"), FontSize = 12 };
     private readonly Button recordButton;
     private readonly Button stopButton;
@@ -97,7 +97,14 @@ public sealed class MainWindow : Window
         Populate();
         Loaded += async (_, _) =>
         {
-            if (smoke) { await Task.Delay(700); SaveScreenshot(); closeAllowed = true; Close(); return; }
+            if (smoke)
+            {
+                await Task.Delay(700); SaveScreenshot();
+                tabs.SelectedIndex = 1;
+                await Task.Delay(250);
+                SaveScreenshot(Path.Combine(AppContext.BaseDirectory, "docs", "AirTake-settings.png"));
+                closeAllowed = true; Close(); return;
+            }
             try { await StartReceiver(); } catch (Exception ex) { AddLog(ex.Message); status.Text = "Не удалось запустить приёмник"; }
             timer.Tick += async (_, _) => await Refresh(); timer.Start();
         };
@@ -117,7 +124,7 @@ public sealed class MainWindow : Window
         var grid = new Grid(); grid.ColumnDefinitions.Add(new() { Width = new(1, GridUnitType.Star) }); grid.ColumnDefinitions.Add(new() { Width = new(290) });
         var left = new Grid { Margin = new(0, 0, 18, 0) }; left.RowDefinitions.Add(new() { Height = GridLength.Auto }); left.RowDefinitions.Add(new() { Height = new(1, GridUnitType.Star) }); left.RowDefinitions.Add(new() { Height = GridLength.Auto }); left.RowDefinitions.Add(new() { Height = new(115) });
         var title = new StackPanel { Margin = new(18, 16, 18, 12) }; title.Children.Add(mode); title.Children.Add(Text("HEVC · задняя основная камера 1× · изображение без перекодирования", 12)); left.Children.Add(title);
-        var imageArea = new Grid { Background = Brushes.Black, Margin = new(0, 0, 0, 14), MinHeight = 260 }; imageArea.Children.Add(preview);
+        var imageArea = new Grid { Background = Brushes.Black, Margin = new(0, 0, 0, 14), ClipToBounds = true }; imageArea.Children.Add(preview);
         previewHint.HorizontalAlignment = HorizontalAlignment.Center; previewHint.VerticalAlignment = VerticalAlignment.Center; imageArea.Children.Add(previewHint);
         Grid.SetRow(imageArea, 1); left.Children.Add(imageArea);
         var controls = new StackPanel(); metrics.Margin = new(0, 0, 0, 10); controls.Children.Add(metrics);
@@ -125,12 +132,12 @@ public sealed class MainWindow : Window
         controls.Children.Add(microphoneStatus); disk.Margin = new(0, 6, 0, 8); controls.Children.Add(disk); controls.Children.Add(warning);
         Grid.SetRow(controls, 2); left.Children.Add(controls);
         var logs = Card(log); logs.Margin = new(0, 14, 0, 0); Grid.SetRow(logs, 3); left.Children.Add(logs); grid.Children.Add(left);
-        var pair = new StackPanel { Margin = new(18) }; pair.Children.Add(Text("ПОДКЛЮЧЕНИЕ IPHONE", 12, true)); pair.Children.Add(qr); pair.Children.Add(url);
+        var pair = new StackPanel { Margin = new(12) }; pair.Children.Add(Text("ПОДКЛЮЧЕНИЕ IPHONE", 12, true)); pair.Children.Add(qr); pair.Children.Add(url);
         pair.Children.Add(Button("Скопировать подключение", () => { if (receiver?.Pairing is not null) Clipboard.SetText(JsonSerializer.Serialize(receiver.Pairing, Json.Options)); return Task.CompletedTask; }));
         pair.Children.Add(Text("Откройте AirTake Camera на iPhone и отсканируйте QR. Телефон и ПК должны быть в одной локальной сети.", 13));
         pair.Children.Add(Button("Открыть папку записей", () => { Directory.CreateDirectory(prefs.OutputFolder); Open(prefs.OutputFolder); return Task.CompletedTask; }));
         pair.Children.Add(Text("TLS + привязка сертификата\nSHA-256 каждого фрагмента\nПовтор передачи после обрыва\nFifine записывается на ПК", 12));
-        var right = Card(pair); Grid.SetColumn(right, 1); grid.Children.Add(right); return grid;
+        var right = Card(new ScrollViewer { Content = pair, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled }); Grid.SetColumn(right, 1); grid.Children.Add(right); return grid;
     }
     private UIElement SettingsView()
     {
@@ -192,7 +199,7 @@ public sealed class MainWindow : Window
     {
         receiver = new Receiver(prefs); receiver.Log = AddLog;
         receiver.OnCompleted = id => Dispatcher.InvokeAsync(() => FinishTake(id)).Task.Unwrap();
-        await receiver.Start(); prefs.Save(); url.Text = receiver.Pairing!.Url;
+        await receiver.Start(); prefs.Save(); url.Text = receiver.Pairing!.Url; port.Text = prefs.Port.ToString();
         using var code = QRCodeGenerator.GenerateQrCode(JsonSerializer.Serialize(receiver.Pairing, Json.Options), QRCodeGenerator.ECCLevel.L);
         using var png = new PngByteQRCode(code); qr.Source = Bitmap(png.GetGraphic(6));
         mode.Text = $"{(prefs.Capture.Width == 3840 ? "4K" : "1080p")} / {prefs.Capture.Fps} FPS"; RefreshTakes();
@@ -306,11 +313,12 @@ public sealed class MainWindow : Window
     }
     private sealed record TakeRow(TakeManifest Manifest)
     { public override string ToString() => $"{Manifest.CreatedUtc.ToLocalTime():dd.MM HH:mm:ss}   {Manifest.Settings.Width}×{Manifest.Settings.Height} / {Manifest.Settings.Fps}   {Manifest.State}"; }
-    private void SaveScreenshot()
+    private void SaveScreenshot(string? destination = null)
     {
         UpdateLayout(); var image = new RenderTargetBitmap((int)ActualWidth, (int)ActualHeight, 96, 96, PixelFormats.Pbgra32); image.Render(this);
         var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
-        var path = smokePath?.EndsWith(".png", StringComparison.OrdinalIgnoreCase) == true ? smokePath : "AirTake-ui.png";
+        var path = destination ?? (smokePath?.EndsWith(".png", StringComparison.OrdinalIgnoreCase) == true ? smokePath : "AirTake-ui.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         using var stream = File.Create(path); encoder.Save(stream);
     }
     private void AddLog(string text)
@@ -321,6 +329,18 @@ public sealed class MainWindow : Window
     private Button Button(string title, Func<Task> action, bool primary = false)
     {
         var button = new Button { Content = title, Padding = new(14, 10, 14, 10), Margin = new(0, 8, 10, 8), Background = Brush(primary ? "79D8CE" : "29374B"), Foreground = primary ? Brush("091B23") : Brushes.White, BorderThickness = new(0), FontWeight = FontWeights.SemiBold, Cursor = System.Windows.Input.Cursors.Hand };
+        button.Template = (ControlTemplate)System.Windows.Markup.XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="{x:Type Button}">
+              <Border x:Name="Chrome" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True" />
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.85" /></Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Chrome" Property="Opacity" Value="0.45" /></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+            """);
         button.Click += async (_, _) => { try { await action(); } catch (Exception ex) { AddLog(ex.Message); MessageBox.Show(ex.Message, "AirTake", MessageBoxButton.OK, MessageBoxImage.Warning); } }; return button;
     }
     private static void Open(string path) => Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });

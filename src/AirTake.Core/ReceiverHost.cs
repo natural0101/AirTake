@@ -32,7 +32,8 @@ public sealed class ReceiverHost : IAsyncDisposable
     public bool PhoneConnected => Clock.Now - LastSeenUnix < 8;
     public bool DesiredRecording => desired;
     public string? ActiveId => active?.Manifest.Id;
-    public bool Busy => active is not null || desired || finishing.Values.Any(t => t.IsValueCreated && !t.Value.IsCompleted);
+    public bool IsFinalizing => finishing.Values.Any(t => t.IsValueCreated && !t.Value.IsCompleted);
+    public bool Busy => active is not null || desired || IsFinalizing;
     public byte[]? Preview => Volatile.Read(ref preview);
     public event Action<string>? Log;
 
@@ -63,7 +64,7 @@ public sealed class ReceiverHost : IAsyncDisposable
         if (!IPAddress.TryParse(options.ListenAddress, out var address) || options.Port is < 1024 or > 65535) throw new ArgumentException("Выберите IPv4-адрес локального сетевого адаптера и порт 1024–65535.");
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReceiverHost).Assembly.FullName });
         builder.Logging.ClearProviders();
-        builder.Services.ConfigureHttpJsonOptions(json => { json.SerializerOptions.PropertyNamingPolicy = Wire.Json.PropertyNamingPolicy; });
+        builder.Services.ConfigureHttpJsonOptions(json => json.SerializerOptions.PropertyNamingPolicy = Wire.Json.PropertyNamingPolicy);
         builder.WebHost.ConfigureKestrel(server =>
         {
             server.AddServerHeader = false;
@@ -88,29 +89,21 @@ public sealed class ReceiverHost : IAsyncDisposable
                 var code = exception is ProtocolException protocol ? protocol.Status : exception is ArgumentException or System.Text.Json.JsonException ? 400 : 500;
                 if (code == 507) desired = false;
                 Report(exception.Message);
-                if (!context.Response.HasStarted)
-                {
-                    context.Response.StatusCode = code;
-                    await context.Response.WriteAsJsonAsync(new { error = exception.Message });
-                }
+                if (!context.Response.HasStarted) { context.Response.StatusCode = code; await context.Response.WriteAsJsonAsync(new { error = exception.Message }); }
             }
         });
         app.MapGet("/v1/clock", () => Results.Json(new { unixSeconds = Clock.Now, version = Wire.Version }));
         app.MapGet("/v1/control", () =>
         {
             if (active is not null && (audio.Error is not null || TakeStore.FreeBytes(options.OutputDirectory) < 512L * 1024 * 1024))
-            {
-                desired = false;
-                Report(audio.Error ?? "Мало места на диске — остановка записи");
-            }
+            { desired = false; Report(audio.Error ?? "Мало места на диске — остановка записи"); }
             return Results.Json(new { version = Wire.Version, recording = desired, capture = options.Capture, activeId = ActiveId, status = Status });
         });
         app.MapPost("/v1/heartbeat", async (HttpContext context) =>
         {
             Limit(context, 64 * 1024);
             var value = await context.Request.ReadFromJsonAsync<PhoneTelemetry>(context.RequestAborted) ?? throw new ProtocolException(400, "Missing telemetry.");
-            Volatile.Write(ref telemetry, value);
-            Interlocked.Exchange(ref lastSeenTicks, (long)(Clock.Now * 1000));
+            Volatile.Write(ref telemetry, value); Interlocked.Exchange(ref lastSeenTicks, (long)(Clock.Now * 1000));
             if (value.Status == "error") { desired = false; Report(value.Message); }
             return Results.Json(new { ok = true });
         });
@@ -118,8 +111,7 @@ public sealed class ReceiverHost : IAsyncDisposable
         {
             Limit(context, 4096);
             var intent = await context.Request.ReadFromJsonAsync<IntentRequest>(context.RequestAborted) ?? throw new ProtocolException(400, "Missing intent.");
-            RequestRecording(intent.Recording);
-            return Results.Json(new { recording = desired });
+            RequestRecording(intent.Recording); return Results.Json(new { recording = desired });
         });
         app.MapPost("/v1/start", async (HttpContext context) =>
         {
@@ -134,17 +126,14 @@ public sealed class ReceiverHost : IAsyncDisposable
                 var store = TakeStore.Create(options, id, request.ClientId);
                 try { if (!options.VideoOnly) await audio.StartAsync(store.AudioPath, options.MicrophoneId); }
                 catch (Exception exception) { store.Manifest.State = "failed"; store.Manifest.Note = exception.Message; store.Save(); desired = false; throw; }
-                stores[id] = store;
-                active = store;
-                Report("REC · " + id);
-                return Results.Json(new { id, capture = store.Manifest.Capture });
+                stores[id] = store; active = store;
+                Report("REC · " + id); return Results.Json(new { id, capture = store.Manifest.Capture });
             }
             finally { lifecycle.Release(); }
         });
         app.MapPost("/v1/takes/{id}/chunks/{index:int}", async (string id, int index, HttpContext context) =>
         {
-            var store = Store(id);
-            Limit(context, Wire.MaxChunkBytes);
+            var store = Store(id); Limit(context, Wire.MaxChunkBytes);
             var next = await store.WriteChunkAsync(index, context.Request.ContentLength!.Value, context.Request.Headers["X-SHA256"].ToString(), context.Request.Body, context.RequestAborted);
             return Results.Json(new { nextIndex = next });
         });
@@ -152,31 +141,48 @@ public sealed class ReceiverHost : IAsyncDisposable
         {
             Limit(context, 16384);
             var end = await context.Request.ReadFromJsonAsync<TakeEnd>(context.RequestAborted) ?? throw new ProtocolException(400, "Missing capture metrics.");
-            end.Validate();
-            await EndAsync(Store(id), end);
+            end.Validate(); await EndAsync(Store(id), end); return Results.Json(new { ok = true });
+        });
+        app.MapPost("/v1/takes/{id}/abort", async (string id, HttpContext context) =>
+        {
+            Limit(context, 4096);
+            var store = Store(id);
+            await lifecycle.WaitAsync(context.RequestAborted);
+            try
+            {
+                await store.Gate.WaitAsync(context.RequestAborted);
+                try
+                {
+                    if (store.Manifest.Chunks.Count != 0) throw new ProtocolException(409, "A take with received video cannot be aborted. Its source files are preserved.");
+                    if (active?.Manifest.Id == store.Manifest.Id)
+                    { store.Manifest.Audio = await audio.StopAsync(); active = null; desired = false; }
+                    store.Manifest.State = "aborted-empty";
+                    store.Manifest.Note = "No video was captured. Any microphone WAV has been retained.";
+                    store.Save();
+                }
+                finally { store.Gate.Release(); }
+            }
+            finally { lifecycle.Release(); }
+            Report("Пустой дубль отменён; приёмник снова готов");
             return Results.Json(new { ok = true });
         });
         app.MapPost("/v1/takes/{id}/finish", async (string id, HttpContext context) =>
         {
             Limit(context, 4096);
             var request = await context.Request.ReadFromJsonAsync<FinishRequest>(context.RequestAborted) ?? throw new ProtocolException(400, "Missing segment count.");
-            var path = await FinishAsync(Store(id), request.Chunks);
-            return Results.Json(new { ok = true, file = Path.GetFileName(path) });
+            var path = await FinishAsync(Store(id), request.Chunks); return Results.Json(new { ok = true, file = Path.GetFileName(path) });
         });
         app.MapPost("/v1/preview", async (HttpContext context) =>
         {
             Limit(context, 512 * 1024);
-            using var stream = new MemoryStream();
-            await context.Request.Body.CopyToAsync(stream, context.RequestAborted);
+            using var stream = new MemoryStream(); await context.Request.Body.CopyToAsync(stream, context.RequestAborted);
             var bytes = stream.ToArray();
             if (bytes.Length < 3 || bytes[0] != 0xff || bytes[1] != 0xd8) throw new ProtocolException(400, "Expected a JPEG preview.");
-            Volatile.Write(ref preview, bytes);
-            return Results.Json(new { ok = true });
+            Volatile.Write(ref preview, bytes); return Results.Json(new { ok = true });
         });
         app.MapPost("/v1/speed", async (HttpContext context) =>
         {
-            Limit(context, Wire.MaxChunkBytes);
-            await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
+            Limit(context, Wire.MaxChunkBytes); await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
             return Results.Json(new { bytes = context.Request.ContentLength });
         });
         await app.StartAsync(cancellationToken);
@@ -196,15 +202,9 @@ public sealed class ReceiverHost : IAsyncDisposable
             try
             {
                 if (store.Manifest.End is not null) return;
-                if (active?.Manifest.Id == store.Manifest.Id)
-                {
-                    store.Manifest.Audio = await audio.StopAsync();
-                    desired = false;
-                }
-                else if (!store.Manifest.VideoOnly) store.Manifest.Note = "Receiver restarted: microphone continuity must be checked.";
-                store.Manifest.End = end;
-                store.Manifest.State = "uploading";
-                store.Save();
+                if (active?.Manifest.Id == store.Manifest.Id) { store.Manifest.Audio = await audio.StopAsync(); desired = false; }
+                else if (!store.Manifest.VideoOnly && store.Manifest.Audio is null) store.Manifest.Note = "Receiver restarted: microphone continuity must be checked.";
+                store.Manifest.End = end; store.Manifest.State = "uploading"; store.Save();
                 Report("Камера остановлена · приём оставшихся фрагментов");
             }
             finally { store.Gate.Release(); }
@@ -228,7 +228,8 @@ public sealed class ReceiverHost : IAsyncDisposable
                 finally { store.Gate.Release(); }
                 if (active?.Manifest.Id == store.Manifest.Id) active = null;
                 var dropped = store.Manifest.End!.CaptureDrops + store.Manifest.End.EncoderDrops + store.Manifest.End.WriterDrops;
-                Report($"Сохранено: {output}" + (dropped > 0 || store.Manifest.End.Interrupted ? " · ПРОВЕРЬТЕ ПРОПУСКИ В take.json" : ""));
+                var warning = dropped > 0 || store.Manifest.End.Interrupted || store.Manifest.Audio?.Error is not null;
+                Report($"Сохранено: {output}" + (warning ? " · ПРОВЕРЬТЕ ПРЕДУПРЕЖДЕНИЯ В take.json" : ""));
                 return output;
             }
             catch (Exception exception)
@@ -236,8 +237,8 @@ public sealed class ReceiverHost : IAsyncDisposable
                 await store.Gate.WaitAsync();
                 try { store.Manifest.State = "finalize-failed"; store.Manifest.Note = exception.Message; store.Save(); }
                 finally { store.Gate.Release(); }
-                Report("Сборка не завершена; исходные фрагменты сохранены. " + exception.Message);
-                throw;
+                if (active?.Manifest.Id == store.Manifest.Id && store.Manifest.End is not null) active = null;
+                Report("Сборка не завершена; исходные фрагменты сохранены. " + exception.Message); throw;
             }
         })).Value;
         try { return await task; }
@@ -247,27 +248,43 @@ public sealed class ReceiverHost : IAsyncDisposable
     {
         if (Busy) throw new InvalidOperationException("Сначала завершите текущую запись.");
         var store = TakeStore.Load(Path.GetDirectoryName(directory)!, Path.GetFileName(directory));
+        if (store.Manifest.State == "complete" && File.Exists(store.Manifest.OutputFile)) return store.Manifest.OutputFile;
         if (videoOnly) store.Manifest.VideoOnly = true;
         store.Manifest.End ??= new TakeEnd { Interrupted = true, Error = "Recovered after interruption; final video segment may be missing." };
-        store.Manifest.State = "uploading";
-        store.Save();
+        store.Manifest.State = "uploading"; store.Save();
         return await FinishAsync(store, store.Manifest.Chunks.Count);
     }
-    public async ValueTask DisposeAsync()
+    public async Task PreserveAndReleaseAsync()
     {
+        if (IsFinalizing) throw new InvalidOperationException("Сейчас выполняется сборка MP4. Не прерывайте её.");
         desired = false;
         await lifecycle.WaitAsync();
         try
         {
-            if (active is not null && active.Manifest.End is null)
+            if (active is not null)
             {
-                active.Manifest.Audio = await audio.StopAsync();
-                active.Manifest.Note = "Receiver closed before capture finished. Pending video may still be on the iPhone.";
-                active.Save();
+                await active.Gate.WaitAsync();
+                try
+                {
+                    if (active.Manifest.End is null) active.Manifest.Audio = await audio.StopAsync();
+                    active.Manifest.Note = "Receiver stopped by user before the take completed. Source segments and microphone WAV are preserved. Reconnect iPhone to resume pending uploads.";
+                    active.Save();
+                }
+                finally { active.Gate.Release(); }
+                active = null;
             }
-            if (app is not null) { await app.StopAsync(TimeSpan.FromSeconds(5)); await app.DisposeAsync(); app = null; }
         }
         finally { lifecycle.Release(); }
+    }
+    public async ValueTask DisposeAsync()
+    {
+        await PreserveAndReleaseAsync();
+        if (app is not null)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try { await app.StopAsync(timeout.Token); } catch (OperationCanceledException) { }
+            await app.DisposeAsync(); app = null;
+        }
     }
     private sealed record IntentRequest(bool Recording);
     private sealed record StartRequest(string Id, string ClientId);

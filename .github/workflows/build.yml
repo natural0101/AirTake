@@ -59,7 +59,9 @@ jobs:
       - name: Package portable application
         shell: pwsh
         run: |
-          if (Test-Path README.md) { Copy-Item README.md package/README.md }
+          Copy-Item README.md package/README.md
+          Copy-Item LICENSE package/LICENSE
+          Copy-Item docs package/docs -Recurse
           Get-ChildItem package -Recurse -File | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize | Out-File package/SHA256SUMS.txt
           Compress-Archive -Path package/* -DestinationPath AirTake-Windows-x64.zip
       - uses: actions/upload-artifact@v4
@@ -74,3 +76,64 @@ jobs:
           name: AirTake-QA
           path: qa/
           retention-days: 30
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install project generator
+        run: brew install xcodegen
+      - name: Generate and compile native iPhone application
+        run: |
+          set -o pipefail
+          cd ios
+          xcodegen generate
+          xcodebuild -project AirTakeCamera.xcodeproj -scheme AirTakeCamera -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tee xcodebuild.log
+      - name: Package unsigned iPhone application
+        run: |
+          mkdir -p ios/package/Payload
+          cp -R ios/build/Build/Products/Release-iphoneos/AirTakeCamera.app ios/package/Payload/
+          cd ios/package
+          zip -qry ../../AirTake-iPhone-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirTake-iPhone-unsigned
+          path: AirTake-iPhone-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirTake-iOS-build-log
+          path: ios/xcodebuild.log
+          retention-days: 30
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [windows, ios]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AirTake-Windows-x64
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: AirTake-iPhone-unsigned
+          path: release
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = `v0.1.0-rc.${context.runNumber}`;
+            let release;
+            try { release = (await github.rest.repos.getReleaseByTag({...context.repo, tag})).data; }
+            catch(e) {
+              if (e.status !== 404) throw e;
+              release = (await github.rest.repos.createRelease({...context.repo, tag_name: tag, target_commitish: context.sha, name: `AirTake ${tag}`, prerelease: true, body: 'Windows: extract the entire ZIP and run AirTake.exe. Runtime and FFmpeg are included. iPhone: the IPA is UNSIGNED and requires your own Apple signing identity before installation. Native device build and Windows protocol/mux tests passed; sustained iPhone 16 Pro 4K/120 recording over your Wi-Fi still needs physical-device validation. See README and docs/START-RU.md.'})).data;
+            }
+            for (const name of ['AirTake-Windows-x64.zip', 'AirTake-iPhone-unsigned.ipa']) {
+              const old = release.assets.find(a => a.name === name);
+              if (old) await github.rest.repos.deleteReleaseAsset({...context.repo, asset_id: old.id});
+              await github.rest.repos.uploadReleaseAsset({...context.repo, release_id: release.id, name, data: fs.readFileSync(`release/${name}`)});
+            }

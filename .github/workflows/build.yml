@@ -1,0 +1,156 @@
+name: Build and verify AirTake
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: airtake-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate icons and retain them in source
+        id: source
+        shell: bash
+        run: |
+          python3 scripts/generate-icons.py
+          git config user.name 'AirTake build'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/AirTake.Desktop/AirTake.ico ios/AirTakeCamera/Assets.xcassets
+          if ! git diff --cached --quiet; then
+            git commit -m 'Generate application icons from checked-in source'
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  tests:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet test tests/AirTake.Tests/AirTake.Tests.csproj -c Release --logger 'trx;LogFileName=tests.trx'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: protocol-tests
+          path: tests/**/TestResults/*.trx
+  media:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm ffmpeg
+      - run: bash scripts/build-media.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: media-and-fixture
+          path: artifacts/
+  ios:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - run: brew install xcodegen
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+      - name: Compile for physical iPhone without signing
+        run: xcodebuild -project ios/AirTakeCamera.xcodeproj -scheme AirTakeCamera -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath artifacts/DerivedData CODE_SIGNING_ALLOWED=NO build
+      - name: Package unsigned companion
+        run: |
+          mkdir -p artifacts/ipa/Payload
+          cp -R artifacts/DerivedData/Build/Products/Release-iphoneos/AirTakeCamera.app artifacts/ipa/Payload/
+          cd artifacts/ipa && zip -qr ../AirTakeCamera-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iphone-unsigned
+          path: artifacts/AirTakeCamera-unsigned.ipa
+  windows:
+    needs: [prepare, tests, media]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          name: media-and-fixture
+          path: artifacts/media-build
+      - name: Publish standalone EXE
+        shell: pwsh
+        run: |
+          dotnet publish src/AirTake.Desktop/AirTake.Desktop.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o artifacts/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
+          New-Item -Type Directory -Force artifacts/windows/tools | Out-Null
+          Copy-Item artifacts/media-build/media/* artifacts/windows/tools -Recurse -Force
+          Copy-Item README.md,LICENSE,START-HERE.txt artifacts/windows/
+          Copy-Item docs artifacts/windows/docs -Recurse
+      - name: Synthetic 4K120 TLS, persistence and audio-mux integration
+        shell: pwsh
+        run: |
+          $fixture = (Resolve-Path artifacts/media-build/fixtures).Path
+          $p = Start-Process artifacts/windows/AirTake.exe -ArgumentList '--integration-test',"`"$fixture`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$fixture/integration-error.txt"; throw 'Integration failed' }
+          Get-Content "$fixture/integration-result.txt"
+      - name: Native GUI startup and screenshot
+        shell: pwsh
+        run: |
+          $screenshot = Join-Path (Resolve-Path artifacts).Path 'AirTake-ui.png'
+          $p = Start-Process artifacts/windows/AirTake.exe -ArgumentList '--smoke-test',"`"$screenshot`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or !(Test-Path $screenshot)) { throw 'GUI smoke test failed' }
+          Compress-Archive artifacts/windows/* artifacts/AirTake-Windows-x64.zip
+          Get-FileHash artifacts/AirTake-Windows-x64.zip -Algorithm SHA256 | Format-List | Out-File artifacts/SHA256-Windows.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-package-and-evidence
+          path: |
+            artifacts/AirTake-Windows-x64.zip
+            artifacts/AirTake-ui.png
+            artifacts/SHA256-Windows.txt
+            artifacts/media-build/fixtures/integration-*.txt
+  release:
+    needs: [prepare, windows, ios]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/release
+      - name: Publish tested preview packages and corresponding media source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v0.1.${{ github.run_number }}"
+          cat > artifacts/release-notes.md <<'NOTES'
+          Native Windows receiver + unsigned iPhone companion.
+          Extract the entire Windows ZIP, then run AirTake.exe. No .NET installation required.
+          The iPhone IPA MUST be signed with your Apple identity before installation.
+          CI covers software tests, native GUI startup and synthetic HEVC 3840x2160/120 transport/audio muxing.
+          Real iPhone 16 Pro capture, Wi-Fi stability and Fifine synchronization have NOT been hardware-qualified.
+          FFmpeg source and license notices are included for redistribution compliance.
+          NOTES
+          find artifacts/release -name '*.zip' -o -name '*.ipa' -o -name '*source.tar.xz' -o -name '*source.tar.xz.asc' -o -name 'AirTake-ui.png' -o -name 'integration-result.txt' -o -name 'SHA256-Windows.txt' > artifacts/assets.txt
+          mapfile -t ASSETS < artifacts/assets.txt
+          gh release create "$TAG" "${ASSETS[@]}" --target '${{ needs.prepare.outputs.sha }}' --prerelease --title "AirTake $TAG — preview" --notes-file artifacts/release-notes.md

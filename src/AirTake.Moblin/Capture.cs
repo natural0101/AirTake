@@ -38,8 +38,11 @@ public sealed class CaptureSettings
         if (!Path.IsPathFullyQualified(Directory)) throw new ArgumentException("Выберите полный путь к папке записи.");
     }
 
+    // Two latency windows plus one second of headroom, with bounded memory use.
+    // FFmpeg forwards ffs to SRTO_FC; the generous flow window prevents clipping RCVBUF.
+    public long ReceiveBufferBytes => Math.Clamp(BitrateMbps * 125000L * (2L * LatencyMs + 1000) / 1000, 16777216L, 536870912L);
     public string CallerUrl => $"srt://{Address}:{Port}?mode=caller&latency={LatencyMs * 1000L}&passphrase={Passphrase}&pbkeylen=16";
-    public string ListenerUrl => $"srt://{Address}:{Port}?mode=listener&transtype=live&latency={LatencyMs * 1000L}&peeridletimeo=8000&passphrase={Passphrase}&pbkeylen=16";
+    public string ListenerUrl => $"srt://{Address}:{Port}?mode=listener&transtype=live&latency={LatencyMs * 1000L}&rcvbuf={ReceiveBufferBytes}&ffs=1048576&passphrase={Passphrase}&pbkeylen=16";
 
     // Moblin's documented custom-URL schema. This imports a preset; it does not remotely control an active camera.
     public string MoblinUrl => "moblin://?" + Uri.EscapeDataString(JsonSerializer.Serialize(new
@@ -98,13 +101,23 @@ public static class MediaTools
     public static List<MicrophoneDevice> ParseMicrophones(string text)
     {
         var list = new List<MicrophoneDevice>();
+        var pendingAudio = false;
         foreach (var line in text.Split('\n'))
         {
-            var device = Regex.Match(line, "\"(?<name>[^\"]+)\" \\(audio\\)");
-            if (device.Success) { list.Add(new(device.Groups["name"].Value, device.Groups["name"].Value)); continue; }
+            var device = Regex.Match(line, "\"(?<name>[^\"]+)\" \\((?<kind>audio|video)\\)");
+            if (device.Success)
+            {
+                pendingAudio = device.Groups["kind"].Value == "audio";
+                if (pendingAudio) list.Add(new(device.Groups["name"].Value, device.Groups["name"].Value));
+                continue;
+            }
             var alternate = Regex.Match(line, "Alternative name \"(?<id>[^\"]+)\"");
-            if (alternate.Success && list.Count > 0 && line.Contains("dshow", StringComparison.OrdinalIgnoreCase))
-                list[^1] = list[^1] with { Id = alternate.Groups["id"].Value };
+            if (alternate.Success)
+            {
+                if (pendingAudio && list.Count > 0 && line.Contains("dshow", StringComparison.OrdinalIgnoreCase))
+                    list[^1] = list[^1] with { Id = alternate.Groups["id"].Value };
+                pendingAudio = false;
+            }
         }
         return list;
     }

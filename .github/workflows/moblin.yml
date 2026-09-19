@@ -1,0 +1,91 @@
+name: AirTake Moblin Windows
+on:
+  push:
+    branches: [main]
+    paths: ['src/AirTake.Moblin/**', '.github/workflows/moblin.yml', 'MOBLIN*', 'Directory.Build.props', 'global.json']
+  pull_request:
+    paths: ['src/AirTake.Moblin/**', '.github/workflows/moblin.yml', 'MOBLIN*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: airtake-moblin-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore verified FFmpeg bundle
+        uses: actions/cache@v4
+        id: media
+        with:
+          path: vendor/ffmpeg
+          key: gyan-ffmpeg-8.1.2-essentials-db580001-v1
+      - name: Download and verify SRT-enabled FFmpeg
+        if: steps.media.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip' -OutFile ffmpeg.zip
+          $expected = 'db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec'
+          if ((Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'FFmpeg checksum mismatch' }
+          Expand-Archive ffmpeg.zip vendor/unpacked -Force
+          New-Item vendor/ffmpeg -ItemType Directory -Force | Out-Null
+          $root = (Get-ChildItem vendor/unpacked -Directory | Select-Object -First 1).FullName
+          Copy-Item "$root/bin/*.exe" vendor/ffmpeg/
+          Get-ChildItem $root -File | Copy-Item -Destination vendor/ffmpeg/
+      - name: Publish Windows application (no custom iOS client)
+        shell: pwsh
+        run: |
+          dotnet publish src/AirTake.Moblin -c Release -r win-x64 --self-contained true -o package -p:DebugType=None -p:DebugSymbols=false
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          New-Item package/tools -ItemType Directory -Force | Out-Null
+          Copy-Item vendor/ffmpeg/* package/tools/ -Recurse
+          Copy-Item MOBLIN.md package/README.md
+          Copy-Item MOBLIN-THIRD-PARTY.md package/THIRD-PARTY.md
+      - name: Application tests and real encrypted 4K120 SRT loopback
+        shell: pwsh
+        run: |
+          New-Item qa -ItemType Directory -Force | Out-Null
+          $p = Start-Process "$PWD/package/AirTake.exe" -ArgumentList @('--self-test', "$PWD/qa") -Wait -PassThru
+          if (Test-Path qa/tests.json) { Get-Content qa/tests.json }
+          if ($p.ExitCode -ne 0) { Get-ChildItem qa -Recurse -Filter *.log | ForEach-Object { Get-Content $_.FullName }; throw 'Application tests failed' }
+      - name: Launch actual Windows UI
+        shell: pwsh
+        run: |
+          $p = Start-Process "$PWD/package/AirTake.exe" -ArgumentList @('--smoke-test', "$PWD/qa/desktop.png") -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or !(Test-Path qa/desktop.png)) { if (Test-Path "$env:TEMP/airtake-error.txt") { Get-Content "$env:TEMP/airtake-error.txt" }; throw 'UI smoke test failed' }
+      - name: Package runnable application
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem package -Recurse -File | Sort-Object FullName | ForEach-Object { $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); $relative = [IO.Path]::GetRelativePath("$PWD/package", $_.FullName); "$hash  $relative" }
+          $lines | Set-Content package/SHA256SUMS.txt
+          Compress-Archive -Path package/* -DestinationPath AirTake-Moblin-Windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirTake-Moblin-Windows-x64
+          path: AirTake-Moblin-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish downloadable prerelease
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'moblin-v0.2.0-${{ github.run_number }}'
+          gh release create $tag AirTake-Moblin-Windows-x64.zip qa/tests.json qa/desktop.png --target '${{ github.sha }}' --title 'AirTake Moblin Windows · 0.2.0 · build ${{ github.run_number }}' --prerelease --notes 'Extract the entire ZIP and launch AirTake.exe. The iPhone sender is the existing Moblin app, not a custom iOS application. Includes SRT/HEVC stream-copy, Fifine/PC microphone, QR preset, settings, reconnect, optional preview and MP4. Tests are synthetic: physical iPhone/Wi-Fi/Fifine validation is still required. 120 FPS is experimental in Moblin; exact automatic A/V sync and recovery of missing source frames are not claimed.'
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirTake-Moblin-QA
+          path: qa/
+          retention-days: 30

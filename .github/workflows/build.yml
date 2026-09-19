@@ -1,7 +1,7 @@
 name: Build and verify AirTake
 on:
   push:
-    branches: [main]
+    branches: [main, airtake-native-verified]
   workflow_dispatch:
 permissions:
   contents: write
@@ -25,7 +25,7 @@ jobs:
           git add src/AirTake.Desktop/AirTake.ico ios/AirTakeCamera/Assets.xcassets
           if ! git diff --cached --quiet; then
             git commit -m 'Generate application icons from checked-in source'
-            git push origin HEAD:main
+            git push origin HEAD:'${{ github.ref_name }}'
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   tests:

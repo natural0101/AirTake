@@ -44,7 +44,7 @@ public sealed class CaptureSettings
     public string CallerUrl => $"srt://{Address}:{Port}?mode=caller&latency={LatencyMs * 1000L}&passphrase={Passphrase}&pbkeylen=16";
     public string ListenerUrl => $"srt://{Address}:{Port}?mode=listener&transtype=live&latency={LatencyMs * 1000L}&rcvbuf={ReceiveBufferBytes}&ffs=1048576&passphrase={Passphrase}&pbkeylen=16";
 
-    // Moblin's documented custom-URL schema. This imports a preset; it does not remotely control an active camera.
+    // This imports a Moblin preset; it does not remotely control an active camera.
     public string MoblinUrl => "moblin://?" + Uri.EscapeDataString(JsonSerializer.Serialize(new
     {
         streams = new[] { new {
@@ -125,7 +125,6 @@ public static class MediaTools
     public static async Task<List<MicrophoneDevice>> MicrophonesAsync()
     {
         var result = await RunAsync(Ffmpeg, ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"], 20);
-        // DirectShow enumeration intentionally exits nonzero after listing devices.
         return ParseMicrophones(result.Error);
     }
 
@@ -140,12 +139,12 @@ public static class MediaTools
                 "-f", "dshow", "-audio_buffer_size", "50", "-i", "audio=" + s.Microphone]);
         }
         args.AddRange(["-map", "0:v:0", "-c:v", "copy"]);
-        if (s.RecordMicrophone) args.AddRange(["-map", "1:a:0", "-c:a", "pcm_s16le", "-ar", "48000"]);
+        if (s.RecordMicrophone) args.AddRange(["-map", "1:a:0", "-c:a", "pcm_s16le", "-ar", "48000", "-shortest"]);
         else args.Add("-an");
         args.AddRange(["-max_interleave_delta", "1000000", "-cluster_time_limit", "1000", "-flush_packets", "1", "-f", "matroska", file]);
         if (previewPort > 0)
             args.AddRange(["-map", "0:v:0", "-c:v", "copy", "-an", "-f", "mpegts", $"udp://127.0.0.1:{previewPort}?pkt_size=1316"]);
-        // Deliberately no -r, fps filter or video encoder: preserve incoming frames, timestamps, codec and resolution.
+        // No -r, fps filter or video encoder: preserve the incoming stream.
         return args;
     }
 
@@ -237,10 +236,8 @@ public sealed class CaptureSession
                     {
                         line = MediaTools.Redact(line);
                         await logWriter.WriteLineAsync(line);
-                        if (line.Contains("Video:", StringComparison.Ordinal))
-                            Volatile.Write(ref stream, line.Trim());
-                        if (line.Contains("Error", StringComparison.OrdinalIgnoreCase) || line.Contains("corrupt", StringComparison.OrdinalIgnoreCase) || line.Contains("failed", StringComparison.OrdinalIgnoreCase))
-                            Message(line);
+                        if (line.Contains("Video:", StringComparison.Ordinal)) Volatile.Write(ref stream, line.Trim());
+                        if (line.Contains("Error", StringComparison.OrdinalIgnoreCase) || line.Contains("corrupt", StringComparison.OrdinalIgnoreCase) || line.Contains("failed", StringComparison.OrdinalIgnoreCase)) Message(line);
                     }
                 });
                 var progress = Task.Run(async () => {
@@ -256,12 +253,23 @@ public sealed class CaptureSession
                         }
                     }
                 });
+                long observedFrames = 0;
+                var lastVideo = Stopwatch.GetTimestamp();
+                var stalled = false;
                 while (!p.HasExited && !token.IsCancellationRequested)
                 {
                     if (MediaTools.FreeBytes(settings.Directory) is >= 0 and < 536870912)
                     {
                         Message("Остановка: на диске осталось менее 512 МБ. Исходные файлы сохранены.");
-                        cancel?.Cancel();
+                        cancel?.Cancel(); break;
+                    }
+                    var currentFrames = Frames;
+                    if (currentFrames != observedFrames) { observedFrames = currentFrames; lastVideo = Stopwatch.GetTimestamp(); }
+                    else if (observedFrames > 0 && Stopwatch.GetElapsedTime(lastVideo).TotalSeconds > Math.Max(20, settings.LatencyMs / 1000.0 * 3))
+                    {
+                        stalled = true;
+                        SetState("Видеопоток остановился — сохранение части");
+                        Message("Нет новых видеокадров: заканчиваем текущую часть, вместо бесконечной записи одного звука.");
                         break;
                     }
                     await Task.Delay(200);
@@ -278,7 +286,7 @@ public sealed class CaptureSession
                 var length = File.Exists(file) ? new FileInfo(file).Length : 0;
                 if (length > 1000) { lock (gate) files.Add(file); }
                 parts.Add(new { file = Path.GetFileName(file), startedUtc = started, finishedUtc = DateTimeOffset.UtcNow,
-                    bytes = length, reportedFrames = Frames, reportedDurationSeconds = Seconds, exitCode = p.ExitCode, forcedStop = forced });
+                    bytes = length, reportedFrames = Frames, reportedDurationSeconds = Seconds, exitCode = p.ExitCode, forcedStop = forced, videoStalled = stalled });
                 await SaveManifestAsync();
                 Message($"Часть {index}: {length / 1000000.0:F1} МБ, кадров по FFmpeg: {Frames}. Код выхода: {p.ExitCode}.");
                 if (token.IsCancellationRequested || !settings.AutoReconnect) break;

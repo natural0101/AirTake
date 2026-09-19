@@ -12,6 +12,7 @@ concurrency:
 jobs:
   ffmpeg:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -34,6 +35,7 @@ jobs:
   windows:
     runs-on: windows-latest
     needs: ffmpeg
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -54,7 +56,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item qa -ItemType Directory -Force | Out-Null
-          $p = Start-Process -FilePath "$PWD/package/AirTake.exe" -ArgumentList @('--smoke-test', "$PWD/qa/desktop.png") -Wait -PassThru
+          $p = Start-Process -FilePath "$PWD/package/AirTake.exe" -ArgumentList @('--smoke-test', "$PWD/qa/desktop.png") -PassThru
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'EXE smoke test timed out' }
           if ($p.ExitCode -ne 0) { if (Test-Path smoke-error.txt) { Get-Content smoke-error.txt }; throw 'EXE smoke test failed' }
       - name: Package portable application
         shell: pwsh
@@ -62,7 +65,14 @@ jobs:
           Copy-Item README.md package/README.md
           Copy-Item LICENSE package/LICENSE
           Copy-Item docs package/docs -Recurse
-          Get-ChildItem package -Recurse -File | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize | Out-File package/SHA256SUMS.txt
+          $root = (Resolve-Path package).Path
+          $files = @(Get-ChildItem package -Recurse -File | Where-Object Name -ne 'SHA256SUMS.txt')
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\','/')
+            "$hash  $relative"
+          }
+          $lines | Set-Content -LiteralPath package/SHA256SUMS.txt -Encoding utf8
           Compress-Archive -Path package/* -DestinationPath AirTake-Windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -78,8 +88,13 @@ jobs:
           retention-days: 30
   ios:
     runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Test the native persistent upload queue
+        run: |
+          swiftc -swift-version 5 ios/AirTakeCamera/Models.swift ios/AirTakeCamera/DiskSpool.swift tests/ios/main.swift -o /tmp/airtake-spool-tests
+          /tmp/airtake-spool-tests
       - name: Install project generator
         run: brew install xcodegen
       - name: Generate and compile native iPhone application
@@ -104,12 +119,15 @@ jobs:
         if: always()
         with:
           name: AirTake-iOS-build-log
-          path: ios/xcodebuild.log
+          path: |
+            ios/xcodebuild.log
+            qa/ios-spool-tests.json
           retention-days: 30
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [windows, ios]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -130,7 +148,7 @@ jobs:
             try { release = (await github.rest.repos.getReleaseByTag({...context.repo, tag})).data; }
             catch(e) {
               if (e.status !== 404) throw e;
-              release = (await github.rest.repos.createRelease({...context.repo, tag_name: tag, target_commitish: context.sha, name: `AirTake ${tag}`, prerelease: true, body: 'Windows: extract the entire ZIP and run AirTake.exe. Runtime and FFmpeg are included. iPhone: the IPA is UNSIGNED and requires your own Apple signing identity before installation. Native device build and Windows protocol/mux tests passed; sustained iPhone 16 Pro 4K/120 recording over your Wi-Fi still needs physical-device validation. See README and docs/START-RU.md.'})).data;
+              release = (await github.rest.repos.createRelease({...context.repo, tag_name: tag, target_commitish: context.sha, name: `AirTake ${tag}`, prerelease: true, body: 'Windows: extract the entire ZIP and run AirTake.exe. Runtime and FFmpeg are included. iPhone: the IPA is UNSIGNED and requires your own Apple signing identity before installation. Native device build, persistent phone-queue tests and Windows protocol/mux tests passed; sustained iPhone 16 Pro 4K/120 recording over your Wi-Fi still needs physical-device validation. See README and docs/START-RU.md.'})).data;
             }
             for (const name of ['AirTake-Windows-x64.zip', 'AirTake-iPhone-unsigned.ipa']) {
               const old = release.assets.find(a => a.name === name);

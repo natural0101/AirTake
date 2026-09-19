@@ -9,30 +9,31 @@ struct SpoolMetadata: Codable {
     var endSent = false
     var end = TakeEnd()
 }
-
 final class DiskSpool {
     private let lock = NSLock()
     private let root: URL
     private var meta: SpoolMetadata?
     private var bytes: Int64 = 0
     var onPressure: (() -> Void)?
-    init() throws {
-        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        root = support.appendingPathComponent("AirTakeSpool", isDirectory: true)
+    init(directory: URL? = nil) throws {
+        if let directory { root = directory }
+        else {
+            let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            root = support.appendingPathComponent("AirTakeSpool", isDirectory: true)
+        }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var flags = URLResourceValues(); flags.isExcludedFromBackup = true
         var mutableRoot = root; try mutableRoot.setResourceValues(flags)
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             meta = try JSONDecoder().decode(SpoolMetadata.self, from: Data(contentsOf: metadataURL))
+            guard let state = meta, UUID(uuidString: state.id) != nil, state.nextIndex >= 0, state.acknowledged >= 0, state.acknowledged <= state.nextIndex else { throw AirTakeError.message("Журнал очереди повреждён. Фрагменты оставлены на диске.") }
             for url in try segmentFiles() {
                 guard let index = Int(url.deletingPathExtension().lastPathComponent) else { continue }
                 if index < meta!.acknowledged { try FileManager.default.removeItem(at: url); continue }
-                bytes += try size(url)
-                meta!.nextIndex = max(meta!.nextIndex, index + 1)
+                bytes += try size(url); meta!.nextIndex = max(meta!.nextIndex, index + 1)
             }
             if meta!.closed == false {
-                meta!.closed = true
-                meta!.end.interrupted = true
+                meta!.closed = true; meta!.end.interrupted = true
                 meta!.end.error = "Приложение iPhone было закрыто. Последний незавершённый фрагмент мог не сохраниться."
             }
             try saveLocked()
@@ -48,32 +49,29 @@ final class DiskSpool {
         try handle.synchronize(); try handle.close()
     }
     private func saveLocked() throws {
-        guard let meta else { return }
-        try durableWrite(JSONEncoder().encode(meta), to: metadataURL)
+        guard let meta else { return }; try durableWrite(JSONEncoder().encode(meta), to: metadataURL)
     }
     var metadata: SpoolMetadata? { lock.lock(); defer { lock.unlock() }; return meta }
     var pendingBytes: Int64 { lock.lock(); defer { lock.unlock() }; return bytes }
     func create(id: String, options: CaptureOptions) throws {
         lock.lock(); defer { lock.unlock() }
         guard meta == nil else { throw AirTakeError.message("Сначала завершите передачу предыдущей записи.") }
-        meta = SpoolMetadata(id: id, options: options); bytes = 0
-        try saveLocked()
+        guard UUID(uuidString: id) != nil else { throw AirTakeError.message("Некорректный идентификатор дубля.") }
+        meta = SpoolMetadata(id: id, options: options); bytes = 0; try saveLocked()
     }
     func append(_ data: Data) throws {
         var pressure = false
         lock.lock()
         do {
             guard var state = meta, !state.closed else { throw AirTakeError.message("Нет открытой записи для фрагмента.") }
-            guard data.count <= 64 * 1024 * 1024 else { throw AirTakeError.message("Фрагмент превысил 64 МиБ.") }
+            guard data.count > 0, data.count <= 64 * 1024 * 1024 else { throw AirTakeError.message("Размер фрагмента должен быть от 1 байта до 64 МиБ.") }
             let free = try root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
             guard free > Int64(data.count) + 128 * 1024 * 1024 else { throw AirTakeError.message("Недостаточно памяти iPhone. Сохранённые фрагменты не удалены.") }
             let limit = Int64(state.options.bufferMiB) * 1024 * 1024
             guard bytes + Int64(data.count) <= limit + 128 * 1024 * 1024 else { throw AirTakeError.message("Переполнен аварийный буфер. Запись прервана; очередь сохранена.") }
             try durableWrite(data, to: segmentURL(state.nextIndex))
-            state.nextIndex += 1; bytes += Int64(data.count); meta = state
-            try saveLocked()
-            pressure = bytes >= limit
-            lock.unlock()
+            state.nextIndex += 1; bytes += Int64(data.count); meta = state; try saveLocked()
+            pressure = bytes >= limit; lock.unlock()
         } catch { lock.unlock(); throw error }
         if pressure { onPressure?() }
     }
@@ -85,9 +83,7 @@ final class DiskSpool {
     func acknowledge(_ next: Int) throws {
         lock.lock(); defer { lock.unlock() }
         guard var state = meta, next >= state.acknowledged, next <= state.nextIndex else { throw AirTakeError.message("Некорректное подтверждение от ПК.") }
-        let previous = state.acknowledged
-        state.acknowledged = next; meta = state
-        // Persist the ACK before deleting data. Lost replies cause safe retransmission.
+        let previous = state.acknowledged; state.acknowledged = next; meta = state
         try saveLocked()
         for index in previous..<next {
             let url = segmentURL(index)
@@ -101,13 +97,9 @@ final class DiskSpool {
     }
     func close(_ end: TakeEnd) throws {
         lock.lock(); defer { lock.unlock() }
-        guard meta != nil else { return }
-        meta!.end = end; meta!.closed = true; try saveLocked()
+        guard meta != nil else { return }; meta!.end = end; meta!.closed = true; try saveLocked()
     }
-    func markEndSent() throws {
-        lock.lock(); defer { lock.unlock() }
-        meta?.endSent = true; try saveLocked()
-    }
+    func markEndSent() throws { lock.lock(); defer { lock.unlock() }; meta?.endSent = true; try saveLocked() }
     func clearCompleted() throws {
         lock.lock(); defer { lock.unlock() }
         guard let state = meta, state.closed, state.acknowledged == state.nextIndex else { throw AirTakeError.message("Нельзя удалить неподтверждённую запись.") }

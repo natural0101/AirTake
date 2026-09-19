@@ -1,0 +1,6 @@
+dist/
+tools/
+*.exe
+*.zip
+*.log
+*.test

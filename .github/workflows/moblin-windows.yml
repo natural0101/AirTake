@@ -1,0 +1,118 @@
+name: AirTake Moblin Windows
+
+on:
+  push:
+    branches: [feat/moblin-windows, main]
+    paths: ['moblin-desktop/**', '.airtake-moblin-source/**', '.github/workflows/moblin-windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: airtake-moblin-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize verified source bundle
+        shell: pwsh
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path '.airtake-moblin-source') {
+            $text = (Get-ChildItem '.airtake-moblin-source/part*.b64' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+            $bytes = [Convert]::FromBase64String($text)
+            $actual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+            $expected = (Get-Content '.airtake-moblin-source/source.sha256' -Raw).Trim()
+            if ($actual -ne $expected) { throw 'Source bundle checksum mismatch' }
+            $inputStream = [IO.MemoryStream]::new($bytes)
+            $brotli = [IO.Compression.BrotliStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+            $reader = [IO.StreamReader]::new($brotli, [Text.Encoding]::UTF8)
+            try { $files = $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable } finally { $reader.Dispose(); $inputStream.Dispose() }
+            $root = Join-Path $pwd 'moblin-desktop'
+            foreach ($name in $files.Keys) {
+              if ($name -match '(^/|\\|:|(^|/)\.\.(/|$))') { throw "Invalid source path: $name" }
+              $path = Join-Path $root $name
+              New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
+              [IO.File]::WriteAllText($path, [string]$files[$name], [Text.UTF8Encoding]::new($false))
+            }
+            Remove-Item '.airtake-moblin-source' -Recurse -Force
+            git config user.name 'AirTake Build'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+            git add -- moblin-desktop .airtake-moblin-source
+            git commit -m 'Add Moblin Windows recorder, local UI, tests and documentation'
+            if ($LASTEXITCODE -ne 0) { throw 'Source commit failed' }
+            git push origin "HEAD:$env:SOURCE_BRANCH"
+            if ($LASTEXITCODE -ne 0) { throw 'Source push failed' }
+          }
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Unit and concurrency tests
+        working-directory: moblin-desktop
+        shell: pwsh
+        run: |
+          go test -race -v ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+      - name: Prepare verified test-only FFmpeg
+        working-directory: moblin-desktop
+        shell: pwsh
+        run: |
+          ./scripts/prepare-tools.ps1 -Destination tools
+          "$pwd/tools" >> $env:GITHUB_PATH
+      - name: Real encrypted SRT, 4K120 and audio mux tests
+        working-directory: moblin-desktop
+        shell: pwsh
+        env:
+          AIRTAKE_MEDIA_TESTS: '1'
+          AIRTAKE_SRT_TESTS: '1'
+        run: |
+          go test -race -v ./internal/engine | Tee-Object media-test-report.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Media integration tests failed' }
+      - name: Build portable Windows application
+        working-directory: moblin-desktop
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags='-s -w -H=windowsgui' -o dist/AirTake.exe ./cmd/airtake
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          Copy-Item README.md,LICENSE,THIRD-PARTY-NOTICES.txt,START-HERE-RU.txt,media-test-report.txt dist
+          go version | Out-File dist/build-info.txt
+          git rev-parse HEAD | Out-File -Append dist/build-info.txt
+      - name: Run actual Windows EXE smoke test
+        working-directory: moblin-desktop
+        shell: pwsh
+        run: ./scripts/smoke-windows.ps1 -Exe ./dist/AirTake.exe
+      - name: Package without third-party executables
+        working-directory: moblin-desktop
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath AirTake-Moblin-Windows-x64.zip
+          Get-FileHash AirTake-Moblin-Windows-x64.zip -Algorithm SHA256 | Format-List | Out-File SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirTake-Moblin-Windows-x64
+          path: |
+            moblin-desktop/AirTake-Moblin-Windows-x64.zip
+            moblin-desktop/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish Windows-only preview release
+        working-directory: moblin-desktop
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "moblin-v0.1.0-build.$env:GITHUB_RUN_NUMBER"
+          $sha = git rev-parse HEAD
+          gh release create $tag AirTake-Moblin-Windows-x64.zip SHA256.txt --target $sha --title 'AirTake Moblin · Windows x64' --notes-file RELEASE-NOTES.md --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

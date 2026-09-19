@@ -78,6 +78,7 @@ internal sealed class CaptureWindow : Form
     private CaptureSession? session;
     private bool ready;
     private bool closing;
+    private bool starting;
     private readonly bool smoke;
     private static string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AirTake", "moblin-settings.json");
 
@@ -91,8 +92,11 @@ internal sealed class CaptureWindow : Form
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 2, RowCount = 3, BackColor = Background };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 51)); root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82)); root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); root.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
-        var header = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
-        header.Controls.Add(Label("AIRTAKE", 25, true)); header.Controls.Add(Label("MOBLIN  →  WI-FI  →  WINDOWS SSD", 10));
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = Padding.Empty };
+        header.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        header.Controls.Add(Label("AIRTAKE", 25, true), 0, 0);
+        header.Controls.Add(Label("MOBLIN  →  WI-FI  →  WINDOWS SSD", 10), 0, 1);
         root.Controls.Add(header, 0, 0); root.SetColumnSpan(header, 2);
         root.Controls.Add(settingsPanel, 0, 1);
         settingsPanel.Margin = new Padding(0, 0, 12, 0);
@@ -183,7 +187,7 @@ internal sealed class CaptureWindow : Form
                 network.Items.Add(new NetworkChoice(address.Address.ToString(), adapter.Name));
         if (network.Items.Count == 0) network.Items.Add(new NetworkChoice("127.0.0.1", "Нет локальной сети"));
         network.SelectedIndex = 0;
-        for (int i = 0; i < network.Items.Count; i++) if (((NetworkChoice)network.Items[i]).Address == saved.Address) network.SelectedIndex = i;
+        for (int i = 0; i < network.Items.Count; i++) if (network.Items[i] is NetworkChoice choice && choice.Address == saved.Address) network.SelectedIndex = i;
         port.Value = Math.Clamp(saved.Port, 1024, 65535); latency.Value = Math.Clamp(saved.LatencyMs, 200, 10000);
         bitrate.Value = Math.Clamp(saved.BitrateMbps, 10, 200); offset.Value = Math.Clamp(saved.MicrophoneOffsetMs, -10000, 10000);
         fps.SelectedItem = saved.TargetFps is 30 or 60 or 120 ? saved.TargetFps : 120;
@@ -228,11 +232,12 @@ internal sealed class CaptureWindow : Form
 
     private async Task RefreshMicrophonesAsync()
     {
-        if (session?.Running == true) return;
+        if (session?.Running == true || starting) return;
         try
         {
             var selected = ((MicrophoneDevice?)microphone.SelectedItem)?.Id ?? saved.Microphone;
             var devices = await MediaTools.MicrophonesAsync();
+            if (IsDisposed || Disposing) return;
             microphone.Items.Clear();
             foreach (var device in devices) microphone.Items.Add(device);
             var choice = devices.FirstOrDefault(d => d.Id == selected) ?? devices.FirstOrDefault(d => d.Name.Contains("fifine", StringComparison.OrdinalIgnoreCase));
@@ -244,25 +249,28 @@ internal sealed class CaptureWindow : Form
 
     private async Task StartAsync()
     {
-        start.Enabled = false;
+        if (starting || session?.Running == true) return;
+        starting = true; Tick();
         try
         {
             var options = ReadSettings(true);
             if (options.Address == "127.0.0.1") throw new InvalidOperationException("Выберите сетевой адаптер с адресом, доступным iPhone.");
-            await MediaTools.CheckAsync(); UpdateQr(); Save(options);
+            await MediaTools.CheckAsync();
+            if (IsDisposed || Disposing || closing) return;
+            UpdateQr(); Save(options);
             session = new CaptureSession(options); session.Log += AddLog; session.Start();
             AddLog("Приём включён. Теперь нажмите Go Live в Moblin. Микрофон телефона в файл не добавляется.");
         }
-        catch (Exception e) { AddLog(e.Message); MessageBox.Show(this, e.Message, "AirTake", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
-        Tick();
+        catch (Exception e) { AddLog(e.Message); if (!IsDisposed && !Disposing) MessageBox.Show(this, e.Message, "AirTake", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        finally { starting = false; Tick(); }
     }
 
     private void Tick()
     {
-        if (IsDisposed) return;
+        if (IsDisposed || Disposing) return;
         var active = session?.Running == true;
-        settingsPanel.Enabled = !active;
-        start.Enabled = ready && !active; stop.Enabled = active;
+        settingsPanel.Enabled = !active && !starting;
+        start.Enabled = ready && !active && !starting; stop.Enabled = active;
         if (session is not null)
         {
             status.Text = session.State;
